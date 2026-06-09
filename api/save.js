@@ -15,6 +15,12 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
+  // Auth check — request must include the correct secret token
+  const token = req.headers["x-roam-token"];
+  if (!token || token !== process.env.ROAM_SAVE_TOKEN) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
   const apiKey = process.env.AIRTABLE_API_KEY;
   if (!apiKey) {
     return res.status(500).json({ error: "AIRTABLE_API_KEY is not set in Vercel environment variables." });
