@@ -27,15 +27,32 @@ export default async function handler(req, res) {
   const productCode = productCodeMatch[1].toUpperCase();
 
   try {
-    // Fetch product details
-    const productRes = await fetch(`${VIATOR_API_BASE}/products/${productCode}`, {
-      method: "GET",
-      headers: {
-        "exp-api-key": apiKey,
-        "Accept": "application/json;version=2.0",
-        "Accept-Language": "en-US",
-      },
-    });
+    // Fetch all three in parallel — product, availability, exchange rates
+    const [productRes, availRes, ratesRes] = await Promise.all([
+      fetch(`${VIATOR_API_BASE}/products/${productCode}`, {
+        method: "GET",
+        headers: {
+          "exp-api-key": apiKey,
+          "Accept": "application/json;version=2.0",
+          "Accept-Language": "en-US",
+        },
+      }),
+      fetch(`${VIATOR_API_BASE}/availability/schedules/${productCode}`, {
+        method: "GET",
+        headers: {
+          "exp-api-key": apiKey,
+          "Accept": "application/json;version=2.0",
+          "Accept-Language": "en-US",
+        },
+      }),
+      fetch(`${VIATOR_API_BASE}/exchange-rates`, {
+        method: "GET",
+        headers: {
+          "exp-api-key": apiKey,
+          "Accept": "application/json;version=2.0",
+        },
+      }),
+    ]);
 
     const product = await productRes.json();
 
@@ -45,36 +62,43 @@ export default async function handler(req, res) {
       });
     }
 
-    // Fetch availability/pricing
-    let priceInfo = "Not available";
-    let currency = "JPY";
+    // Parse exchange rates — get JPY to USD rate
+    let jpyToUsd = null;
+    try {
+      if (ratesRes.ok) {
+        const rates = await ratesRes.json();
+        // Response is array of { sourceCurrency, targetCurrency, rate }
+        const jpyRate = rates?.find?.(r => r.sourceCurrency === "JPY" && r.targetCurrency === "USD")
+          || rates?.exchangeRates?.find?.(r => r.sourceCurrency === "JPY" && r.targetCurrency === "USD");
+        if (jpyRate?.rate) jpyToUsd = jpyRate.rate;
+      }
+    } catch (_) {}
+
+    // Parse availability
+    let priceJPY = null;
+    let priceUSD = null;
+    let priceDisplay = "Not available";
     let maxGroupSize = "Not specified";
+    let currency = "JPY";
 
     try {
-      const availRes = await fetch(`${VIATOR_API_BASE}/availability/schedules/${productCode}`, {
-        method: "GET",
-        headers: {
-          "exp-api-key": apiKey,
-          "Accept": "application/json;version=2.0",
-          "Accept-Language": "en-US",
-        },
-      });
-
       if (availRes.ok) {
         const avail = await availRes.json();
-
-        // Get currency
         currency = avail?.currency || "JPY";
 
-        // Get from price via summary (most reliable)
         if (avail?.summary?.fromPrice) {
-          priceInfo = `From ${currency} ${avail.summary.fromPrice.toLocaleString()}`;
+          priceJPY = avail.summary.fromPrice;
+          if (jpyToUsd && currency === "JPY") {
+            priceUSD = Math.ceil(priceJPY * jpyToUsd);
+            priceDisplay = `From $${priceUSD.toLocaleString()} USD`;
+          } else {
+            priceDisplay = `From ${currency} ${priceJPY.toLocaleString()}`;
+          }
         }
 
-        // Get max group size from pricing tiers
+        // Max group size from pricing tiers
         let maxTravelers = 0;
-        const items = avail?.bookableItems || [];
-        for (const item of items) {
+        for (const item of avail?.bookableItems || []) {
           const records = item?.seasons?.[0]?.pricingRecords?.[0]?.pricingDetails || [];
           for (const record of records) {
             if (record.ageBand === "ADULT" && record.maxTravelers > maxTravelers) {
@@ -86,7 +110,7 @@ export default async function handler(req, res) {
       }
     } catch (_) {}
 
-    // Pull fields from product response
+    // Product fields
     const name = product?.title || "Unknown";
     const description = product?.description || "No description available";
 
@@ -120,7 +144,7 @@ SOURCE: Viator
 PRODUCT CODE: ${productCode}
 
 RATING: ${rating} (${reviewCount} reviews)
-PRICE: ${priceInfo} (${pricingType})
+PRICE: ${priceDisplay} (${pricingType})
 DURATION: ${duration}
 MAX GROUP SIZE: ${maxGroupSize}
 LANGUAGE: ${language}
@@ -150,6 +174,8 @@ ${imageUrl}`;
       name,
       imageUrl,
       language,
+      priceUSD,
+      priceJPY,
       formattedText,
     });
   } catch (err) {
