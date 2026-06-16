@@ -58,6 +58,23 @@
   .sub { color: var(--rose-soft); font-size: 14px; line-height: 1.6; margin-bottom: 32px; max-width: 560px; }
   .sub code { background: var(--panel); padding: 2px 7px; border-radius: 5px; color: var(--crimson); font-size: 12px; }
 
+  .section-label {
+    font-size: 10px;
+    letter-spacing: 3px;
+    color: var(--rose);
+    text-transform: uppercase;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .section-label::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--line);
+  }
+
   .card {
     background: var(--panel);
     border: 1px solid var(--line);
@@ -104,6 +121,40 @@
   button:hover:not(:disabled) { transform: translateY(-2px); }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
 
+  /* Fetcher specific */
+  .fetch-result { margin-top: 20px; display: none; }
+  .fetch-result.show { display: block; }
+  .fetch-result-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+  .fetch-tour-name { font-size: 15px; font-weight: 700; color: var(--cream); }
+  .copy-btn {
+    margin-top: 0;
+    width: auto;
+    padding: 8px 18px;
+    font-size: 11px;
+    letter-spacing: 1.5px;
+    border-radius: 8px;
+    background: var(--line);
+  }
+  .copy-btn:hover:not(:disabled) { background: var(--rose); transform: none; }
+  .fetch-text {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 16px;
+    font-family: 'SF Mono', 'Monaco', monospace;
+    font-size: 12px;
+    line-height: 1.7;
+    color: var(--rose-soft);
+    white-space: pre-wrap;
+    max-height: 320px;
+    overflow-y: auto;
+  }
+
   .preview { margin-top: 20px; display: none; }
   .preview.show { display: block; }
   .pv-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
@@ -127,10 +178,30 @@
 
   <div class="wrap">
     <h1>Save a vetted tour</h1>
-    <p class="sub">Paste the scorecard's JSON file below and add the affiliate link and hit save to record the tour in Airtable base.</p>
+    <p class="sub">Fetch tour data from a Viator URL, paste into the vetting artifact, then save the scored JSON to Airtable.</p>
 
+    <!-- STEP 1: FETCH -->
+    <div class="section-label">Step 1 — Fetch tour data</div>
     <div class="card">
-      <label>Scorecard JSON (paste from chat)</label>
+      <label>Viator Tour URL</label>
+      <input id="viatorUrl" placeholder="https://www.viator.com/tours/Tokyo/..." />
+
+      <button id="fetchBtn">Fetch Tour Data →</button>
+      <div class="msg" id="fetchMsg"></div>
+
+      <div class="fetch-result" id="fetchResult">
+        <div class="fetch-result-header">
+          <div class="fetch-tour-name" id="fetchTourName"></div>
+          <button class="copy-btn" id="copyBtn">Copy Text</button>
+        </div>
+        <div class="fetch-text" id="fetchText"></div>
+      </div>
+    </div>
+
+    <!-- STEP 2: SAVE -->
+    <div class="section-label">Step 2 — Save scored tour</div>
+    <div class="card">
+      <label>Scorecard JSON (paste from vetting artifact)</label>
       <textarea id="json" placeholder='{
   "name": "...",
   "city": "Tokyo",
@@ -139,10 +210,6 @@
 }'></textarea>
 
       <div class="row">
-        <div>
-          <label>Affiliate URL (from your dashboard)</label>
-          <input id="affiliate" placeholder="https://..." />
-        </div>
         <div>
           <label>Status</label>
           <select id="status">
@@ -169,9 +236,66 @@
 
 <script>
   const $ = id => document.getElementById(id);
+  const ROAM_TOKEN = "roam-secret-2024";
+
+  // ── STEP 1: FETCH ──────────────────────────────────────────────
+  $("fetchBtn").addEventListener("click", async () => {
+    const url = $("viatorUrl").value.trim();
+    const fetchMsg = $("fetchMsg");
+    fetchMsg.className = "msg";
+    $("fetchResult").classList.remove("show");
+
+    if (!url) {
+      fetchMsg.textContent = "Paste a Viator tour URL first.";
+      fetchMsg.classList.add("show", "err");
+      return;
+    }
+
+    const btn = $("fetchBtn");
+    btn.disabled = true;
+    btn.textContent = "Fetching...";
+
+    try {
+      const res = await fetch("/api/fetch-tour", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-roam-token": ROAM_TOKEN,
+        },
+        body: JSON.stringify({ url }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || "Unknown error");
+      }
+
+      $("fetchTourName").textContent = data.name;
+      $("fetchText").textContent = data.formattedText;
+      $("fetchResult").classList.add("show");
+
+    } catch (err) {
+      fetchMsg.textContent = "Fetch failed: " + err.message;
+      fetchMsg.classList.add("show", "err");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Fetch Tour Data →";
+    }
+  });
+
+  // Copy button
+  $("copyBtn").addEventListener("click", () => {
+    const text = $("fetchText").textContent;
+    navigator.clipboard.writeText(text).then(() => {
+      $("copyBtn").textContent = "Copied!";
+      setTimeout(() => { $("copyBtn").textContent = "Copy Text"; }, 2000);
+    });
+  });
+
+  // ── STEP 2: SAVE ───────────────────────────────────────────────
   const jsonEl = $("json"), preview = $("preview"), msg = $("msg");
 
-  // Live preview as they paste
   jsonEl.addEventListener("input", () => {
     msg.className = "msg";
     try {
@@ -197,7 +321,6 @@
       return;
     }
 
-    payload.affiliate_url = $("affiliate").value.trim();
     payload.status = $("status").value;
 
     const btn = $("saveBtn");
@@ -207,7 +330,10 @@
     try {
       const res = await fetch("/api/save", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-roam-token": ROAM_TOKEN,
+        },
         body: JSON.stringify(payload),
       });
       const data = await res.json();
@@ -215,7 +341,6 @@
         msg.innerHTML = "✓ Saved to Airtable — record <code>" + data.id + "</code>. Sync Framer to see it live.";
         msg.classList.add("show", "ok");
         jsonEl.value = "";
-        $("affiliate").value = "";
         preview.classList.remove("show");
       } else {
         throw new Error(data.error || "Unknown error");
