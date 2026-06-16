@@ -1,19 +1,15 @@
 // Roam Trips — Viator Tour Fetcher (runs on Vercel, server-side)
 // ──────────────────────────────────────────────────────────────────
 // Receives a Viator URL, extracts the product code, fetches tour data
-// from Viator sandbox API, and returns formatted text for the vetting artifact.
-//
-// VIATOR_API_KEY is set in Vercel environment variables — never exposed in browser.
+// from Viator production API, and returns formatted text for the vetting artifact.
 
 const VIATOR_API_BASE = "https://api.viator.com/partner";
 
 export default async function handler(req, res) {
-  // Only allow POST
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  // Auth check
   const token = req.headers["x-roam-token"];
   if (!token || token !== process.env.ROAM_SAVE_TOKEN) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -30,18 +26,15 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "No URL provided." });
   }
 
-  // Extract product code from Viator URL
-  // Viator URLs look like: /tours/Tokyo/Tour-Name/d334-12345P1
-  // Product code is the last segment after the last dash group e.g. 12345P1
   const productCodeMatch = url.match(/\/d\d+-([A-Z0-9]+)/i);
   if (!productCodeMatch) {
     return res.status(400).json({ error: "Could not extract product code from URL. Make sure it's a valid Viator tour URL." });
   }
 
   const productCode = productCodeMatch[1].toUpperCase();
+  console.log("DEBUG product code:", productCode);
 
   try {
-    // Fetch product details
     const productRes = await fetch(`${VIATOR_API_BASE}/products/${productCode}`, {
       method: "GET",
       headers: {
@@ -51,14 +44,16 @@ export default async function handler(req, res) {
       },
     });
 
+    const product = await productRes.json();
+
+    // LOG FULL RESPONSE so we can see exact field structure
+    console.log("DEBUG full product response:", JSON.stringify(product, null, 2));
+
     if (!productRes.ok) {
-      const err = await productRes.json().catch(() => ({}));
       return res.status(productRes.status).json({
-        error: `Viator API error: ${err?.message || productRes.statusText}`,
+        error: `Viator API error: ${product?.message || productRes.statusText}`,
       });
     }
-
-    const product = await productRes.json();
 
     // Fetch availability/pricing
     let priceInfo = "Not available";
@@ -76,17 +71,15 @@ export default async function handler(req, res) {
       );
       if (availRes.ok) {
         const avail = await availRes.json();
+        console.log("DEBUG avail response:", JSON.stringify(avail, null, 2));
         const prices = avail?.bookableItems?.[0]?.seasons?.[0]?.pricingRecords?.[0]?.tieredPricing;
         if (prices?.length) {
           const minPrice = Math.min(...prices.map((p) => p.price?.original?.recommendedRetailPrice || Infinity));
           if (minPrice !== Infinity) priceInfo = `From USD ${minPrice}`;
         }
       }
-    } catch (_) {
-      // Price fetch failed silently — not critical
-    }
+    } catch (_) {}
 
-    // Pull key fields from product response
     const name = product?.title || "Unknown";
     const description = product?.description || "No description available";
     const duration = product?.itinerary?.duration?.fixedDurationInMinutes
@@ -103,7 +96,6 @@ export default async function handler(req, res) {
     const supplier = product?.supplier?.name || "Not specified";
     const language = product?.languageGuides?.[0]?.language || "English";
 
-    // Format text for pasting into vetting artifact
     const formattedText = `TOUR NAME: ${name}
 
 SOURCE: Viator
