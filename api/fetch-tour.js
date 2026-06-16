@@ -1,34 +1,23 @@
-// Roam Trips — Viator Tour Fetcher (DEBUG VERSION)
+// DEBUG — test exchange rates with POST
 const VIATOR_API_BASE = "https://api.viator.com/partner";
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   const token = req.headers["x-roam-token"];
-  if (!token || token !== process.env.ROAM_SAVE_TOKEN) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+  if (!token || token !== process.env.ROAM_SAVE_TOKEN) return res.status(401).json({ error: "Unauthorized" });
 
   const apiKey = process.env.VIATOR_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "VIATOR_API_KEY not set" });
 
-  const { url } = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-  if (!url) return res.status(400).json({ error: "No URL provided." });
-
-  const productCodeMatch = url.match(/\/d\d+-([A-Z0-9]+)/i);
-  if (!productCodeMatch) return res.status(400).json({ error: "Invalid Viator URL." });
-
-  const productCode = productCodeMatch[1].toUpperCase();
-
-  // Just test the exchange rates endpoint
   const ratesRes = await fetch(`${VIATOR_API_BASE}/exchange-rates`, {
-    method: "GET",
+    method: "POST",
     headers: {
       "exp-api-key": apiKey,
       "Accept": "application/json;version=2.0",
+      "Content-Type": "application/json",
     },
+    body: JSON.stringify({ sourceCurrencies: ["JPY"], targetCurrency: "USD" }),
   });
 
   const rates = await ratesRes.json();
