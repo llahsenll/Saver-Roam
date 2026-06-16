@@ -5,7 +5,7 @@
 //
 // VIATOR_API_KEY is set in Vercel environment variables — never exposed in browser.
 
-const VIATOR_API_BASE = "https://api.sandbox.viator.com/partner";
+const VIATOR_API_BASE = "https://api.viator.com/partner";
 
 export default async function handler(req, res) {
   // Only allow POST
