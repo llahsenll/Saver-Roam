@@ -2,7 +2,7 @@
 // Vercel daily cron — pulls Japan tours from Viator → saves to Supabase tours_raw
 // Runs daily at 2am UTC via vercel.json cron config
 
-const VIATOR_BASE = 'https://api.sandbox.viator.com/partner';
+const VIATOR_BASE = 'https://api.viator.com/partner';
 const VIATOR_KEY = process.env.VIATOR_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL; // https://yejleykbjsdjwhjmuwsw.supabase.co/rest/v1
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
