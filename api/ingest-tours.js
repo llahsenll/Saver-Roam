@@ -158,7 +158,7 @@ export default async function handler(req, res) {
 
     let cursor = savedCursor;
     let pageCount = 0;
-    const MAX_PAGES = 50;
+    const MAX_PAGES = 2;
 
     do {
       let url;
@@ -235,7 +235,7 @@ export default async function handler(req, res) {
 
     log.push(`Done. Pages: ${pageCount}, Fetched: ${totalFetched}, Saved: ${inserted}, Inactive: ${deactivated}, Non-Japan: ${skipped}`);
 
-    return res.status(200).json({
+    const summary = {
       success: true,
       first_run: isFirstRun,
       pages_fetched: pageCount,
@@ -244,15 +244,19 @@ export default async function handler(req, res) {
       inactive_skipped: deactivated,
       non_japan_skipped: skipped,
       has_more: !!cursor,
-      log,
-    });
+    };
+    res.setHeader('Content-Type', 'application/json');
+    return res.status(200).send(JSON.stringify(summary));
 
   } catch (error) {
     console.error('Ingest failed:', error);
-    return res.status(500).json({
+    const errSummary = {
       success: false,
-      error: error.message,
-      log,
-    });
+      error: String(error.message || error),
+      pages_fetched: pageCount,
+      upserted: inserted,
+    };
+    res.setHeader('Content-Type', 'application/json');
+    return res.status(500).send(JSON.stringify(errSummary));
   }
 }
