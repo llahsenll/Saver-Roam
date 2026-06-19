@@ -6,8 +6,12 @@ const VIATOR_KEY = process.env.VIATOR_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
-// Japan destination IDs — we'll log what we actually see and filter broadly
-const JAPAN_DEST_IDS = ['334', '479', '480', '481', '482', '483'];
+// All Japan destination IDs (country + all prefectures/regions)
+const JAPAN_DEST_IDS = new Set([
+  16,50147,60446,5558,50146,5614,23311,50150,50152,50151,50154,50153,50156,
+  50155,50158,50157,50168,50176,50175,50178,50177,50179,50181,50180,50183,
+  50182,50185,50184,50187,50186,50188,50190,50149,50148,25611,23404
+]);
 
 async function supabase(path, method = 'GET', body = null) {
   const res = await fetch(`${SUPABASE_URL}${path}`, {
@@ -102,13 +106,14 @@ function extractDuration(tour) {
 }
 
 function isJapanTour(tour) {
-  const destStr = JSON.stringify(tour.destinations || []);
-  // Match any Japan destination ID or "Japan" text in destinations
-  return JAPAN_DEST_IDS.some(id => destStr.includes(`"${id}"`) || destStr.includes(`'${id}'`)) ||
-    destStr.toLowerCase().includes('japan');
+  // Check all destination references in the tour
+  const dests = tour.destinations || [];
+  return dests.some(d => {
+    const id = Number(d.ref || d.destinationId || d.id || 0);
+    return JAPAN_DEST_IDS.has(id);
+  });
 }
 
-// Upsert in small chunks to avoid Supabase payload limits
 async function upsertChunked(records, log) {
   const CHUNK_SIZE = 25;
   let saved = 0;
@@ -142,7 +147,7 @@ export default async function handler(req, res) {
 
     let cursor = null;
     let pageCount = 0;
-    const MAX_PAGES = 3; // Small limit for testing — increase after confirmed working
+    const MAX_PAGES = 3; // Keep at 3 for now to confirm saves work, then increase
 
     do {
       let url;
@@ -159,13 +164,13 @@ export default async function handler(req, res) {
       cursor = data.nextCursor || null;
       pageCount++;
 
-      // Debug: log destination IDs from first page so we can verify Japan filter
-      if (pageCount === 1) {
-        const sampleDests = products.slice(0, 5).map(t => ({
+      // Debug first page — log raw destinations so we can verify filter is working
+      if (pageCount === 1 && products.length > 0) {
+        const sample = products.slice(0, 3).map(t => ({
           code: t.productCode,
-          dests: t.destinations?.map(d => d.ref) || []
+          destinations: t.destinations,
         }));
-        log.push(`Sample destinations page 1: ${JSON.stringify(sampleDests)}`);
+        log.push(`Page 1 sample destinations: ${JSON.stringify(sample)}`);
       }
 
       const upsertBatch = [];
@@ -175,7 +180,6 @@ export default async function handler(req, res) {
           deactivated++;
           continue;
         }
-
         if (!isJapanTour(tour)) {
           skipped++;
           continue;
@@ -205,7 +209,7 @@ export default async function handler(req, res) {
         });
       }
 
-      log.push(`Page ${pageCount}: ${products.length} fetched, ${upsertBatch.length} Japan, ${skipped} skipped`);
+      log.push(`Page ${pageCount}: ${products.length} fetched, ${upsertBatch.length} Japan, ${skipped} skipped so far`);
 
       if (upsertBatch.length > 0) {
         const saved = await upsertChunked(upsertBatch, log);
