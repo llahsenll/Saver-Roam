@@ -164,7 +164,8 @@ export default async function handler(req, res) {
     log.push(`JPY→USD rate: ${jpyRate}`);
 
     let cursor = savedCursor;
-    const MAX_PAGES = 50;
+    const MAX_PAGES = 1000; // Safety ceiling — real limit is the time budget below
+    const TIME_BUDGET_MS = 55000; // Stop just under Vercel's 60s timeout, save cursor, return
 
     do {
       let url;
@@ -232,7 +233,7 @@ export default async function handler(req, res) {
         log.push(`Page ${pageCount}: ${totalFetched} fetched, ${inserted} Japan saved, ${deactivated} inactive, ${skipped} non-Japan`);
       }
 
-    } while (cursor && pageCount < MAX_PAGES);
+    } while (cursor && pageCount < MAX_PAGES && (Date.now() - new Date(startedAt).getTime()) < TIME_BUDGET_MS);
 
     if (!cursor) {
       await saveState(startedAt, null);
