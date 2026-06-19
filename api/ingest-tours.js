@@ -28,7 +28,13 @@ async function supabase(path, method = 'GET', body = null) {
     throw new Error(`Supabase error ${res.status}: ${err}`);
   }
   if (res.status === 204) return null;
-  return res.json();
+  const text = await res.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new Error(`Supabase response not valid JSON: ${text.substring(0, 200)}`);
+  }
 }
 
 async function viatorGet(path) {
@@ -146,6 +152,7 @@ export default async function handler(req, res) {
   let deactivated = 0;
   let skipped = 0;
   let totalFetched = 0;
+  let pageCount = 0;
 
   try {
     log.push(`Ingest started: ${startedAt}`);
@@ -157,7 +164,6 @@ export default async function handler(req, res) {
     log.push(`JPY→USD rate: ${jpyRate}`);
 
     let cursor = savedCursor;
-    let pageCount = 0;
     const MAX_PAGES = 2;
 
     do {
