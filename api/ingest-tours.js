@@ -1,12 +1,12 @@
 // /api/ingest-tours.js
 // Vercel daily cron — pulls Japan tours from Viator → saves to Supabase tours_raw
+// Saves cursor after every page so runs can resume if they timeout
 
 const VIATOR_BASE = 'https://api.viator.com/partner';
 const VIATOR_KEY = process.env.VIATOR_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
-// All Japan destination IDs (country + all prefectures/regions)
 const JAPAN_DEST_IDS = new Set([
   16,50147,60446,5558,50146,5614,23311,50150,50152,50151,50154,50153,50156,
   50155,50158,50157,50168,50176,50175,50178,50177,50179,50181,50180,50183,
@@ -68,20 +68,30 @@ async function viatorPost(path, body) {
   return res.json();
 }
 
+// Get current ingest state — cursor + timestamp
 async function getIngestState() {
   try {
-    const rows = await supabase('/ingest_meta?select=last_ingested_at&limit=1');
-    if (rows && rows.length > 0 && rows[0].last_ingested_at) {
-      return { isFirstRun: false, lastIngestedAt: rows[0].last_ingested_at };
+    const rows = await supabase('/ingest_meta?select=last_ingested_at,cursor&limit=1');
+    if (rows && rows.length > 0) {
+      return {
+        isFirstRun: !rows[0].last_ingested_at && !rows[0].cursor,
+        lastIngestedAt: rows[0].last_ingested_at || null,
+        savedCursor: rows[0].cursor || null,
+      };
     }
   } catch (e) {
     console.log('No ingest_meta — first run');
   }
-  return { isFirstRun: true, lastIngestedAt: null };
+  return { isFirstRun: true, lastIngestedAt: null, savedCursor: null };
 }
 
-async function setLastIngestTimestamp(ts) {
-  await supabase('/ingest_meta', 'POST', { id: 1, last_ingested_at: ts });
+// Save cursor after each page so we can resume
+async function saveState(ts, cursor) {
+  await supabase('/ingest_meta', 'POST', {
+    id: 1,
+    last_ingested_at: ts,
+    cursor: cursor || null,
+  });
 }
 
 async function getJpyToUsdRate() {
@@ -107,17 +117,7 @@ function extractDuration(tour) {
 
 function isJapanTour(tour) {
   const dests = tour.destinations || [];
-  // ref is a string number e.g. "16", "50157"
   return dests.some(d => JAPAN_DEST_IDS.has(Number(d.ref)));
-}
-
-function getBestImage(images) {
-  if (!images || !images.length) return null;
-  const cover = images.find(i => i.isCover) || images[0];
-  // Get 720x480 variant or largest available
-  const variant = cover.variants?.find(v => v.width === 720) ||
-    cover.variants?.sort((a, b) => b.width - a.width)[0];
-  return variant?.url || null;
 }
 
 async function upsertChunked(records, log) {
@@ -146,25 +146,27 @@ export default async function handler(req, res) {
   try {
     log.push(`Ingest started: ${startedAt}`);
 
-    const { isFirstRun, lastIngestedAt } = await getIngestState();
-    log.push(`First run: ${isFirstRun}`);
+    // Add cursor column to ingest_meta if needed
+    const { isFirstRun, lastIngestedAt, savedCursor } = await getIngestState();
+    log.push(`First run: ${isFirstRun}, resuming from cursor: ${savedCursor ? 'yes' : 'no'}`);
 
     const jpyRate = await getJpyToUsdRate();
     log.push(`JPY→USD rate: ${jpyRate}`);
 
-    let cursor = null;
+    let cursor = savedCursor; // Resume from saved cursor if exists
     let pageCount = 0;
-    // 50 pages × 100 tours = 5000 tours per run
-    // With ~50% inactive, we'll process ~2500 active tours per run
     const MAX_PAGES = 50;
 
     do {
       let url;
-      if (pageCount === 0 && isFirstRun) {
+      if (!cursor && isFirstRun) {
+        // Very first request ever — no cursor, no modifiedSince
         url = `/products/modified-since?count=100`;
-      } else if (pageCount === 0 && !isFirstRun) {
+      } else if (!cursor && !isFirstRun) {
+        // Delta update — use modifiedSince
         url = `/products/modified-since?count=100&modifiedSince=${encodeURIComponent(lastIngestedAt)}`;
       } else {
+        // Resume from saved cursor
         url = `/products/modified-since?count=100&cursor=${encodeURIComponent(cursor)}`;
       }
 
@@ -177,13 +179,10 @@ export default async function handler(req, res) {
       const upsertBatch = [];
 
       for (const tour of products) {
-        // Skip inactive — they only return 4 fields, nothing useful
         if (tour.status !== 'ACTIVE') {
           deactivated++;
           continue;
         }
-
-        // Filter to Japan only
         if (!isJapanTour(tour)) {
           skipped++;
           continue;
@@ -218,16 +217,22 @@ export default async function handler(req, res) {
         inserted += saved;
       }
 
-      // Log every 10 pages
+      // Save cursor after every page so we can resume if we timeout
+      await saveState(startedAt, cursor);
+
       if (pageCount % 10 === 0) {
-        log.push(`Page ${pageCount}: ${totalFetched} fetched total, ${inserted} Japan saved, ${deactivated} inactive, ${skipped} non-Japan`);
+        log.push(`Page ${pageCount}: ${totalFetched} fetched, ${inserted} Japan saved, ${deactivated} inactive, ${skipped} non-Japan`);
       }
 
     } while (cursor && pageCount < MAX_PAGES);
 
-    log.push(`Done. Pages: ${pageCount}, Fetched: ${totalFetched}, Saved: ${inserted}, Inactive: ${deactivated}, Non-Japan: ${skipped}`);
+    // If no more cursor, initial seed is complete — clear cursor
+    if (!cursor) {
+      await saveState(startedAt, null);
+      log.push('Initial seed complete — cursor cleared');
+    }
 
-    await setLastIngestTimestamp(startedAt);
+    log.push(`Done. Pages: ${pageCount}, Fetched: ${totalFetched}, Saved: ${inserted}, Inactive: ${deactivated}, Non-Japan: ${skipped}`);
 
     return res.status(200).json({
       success: true,
@@ -237,6 +242,7 @@ export default async function handler(req, res) {
       upserted: inserted,
       inactive_skipped: deactivated,
       non_japan_skipped: skipped,
+      has_more: !!cursor,
       log,
     });
 
