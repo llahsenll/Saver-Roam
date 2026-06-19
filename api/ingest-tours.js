@@ -90,11 +90,11 @@ async function getJpyToUsdRate() {
   return rate ? rate.rate : null;
 }
 
-function extractMaxGroupSize(pricingDetails) {
-  if (!pricingDetails || !Array.isArray(pricingDetails)) return null;
-  const adultBands = pricingDetails.filter(p => p.ageBand === 'ADULT');
+function extractMaxGroupSize(pricingInfo) {
+  if (!pricingInfo?.ageBands) return null;
+  const adultBands = pricingInfo.ageBands.filter(p => p.ageBand === 'ADULT');
   if (!adultBands.length) return null;
-  return Math.max(...adultBands.map(p => p.maxTravelers || 0)) || null;
+  return Math.max(...adultBands.map(p => p.maxTravelersPerBooking || 0)) || null;
 }
 
 function extractDuration(tour) {
@@ -106,12 +106,18 @@ function extractDuration(tour) {
 }
 
 function isJapanTour(tour) {
-  // Check all destination references in the tour
   const dests = tour.destinations || [];
-  return dests.some(d => {
-    const id = Number(d.ref || d.destinationId || d.id || 0);
-    return JAPAN_DEST_IDS.has(id);
-  });
+  // ref is a string number e.g. "16", "50157"
+  return dests.some(d => JAPAN_DEST_IDS.has(Number(d.ref)));
+}
+
+function getBestImage(images) {
+  if (!images || !images.length) return null;
+  const cover = images.find(i => i.isCover) || images[0];
+  // Get 720x480 variant or largest available
+  const variant = cover.variants?.find(v => v.width === 720) ||
+    cover.variants?.sort((a, b) => b.width - a.width)[0];
+  return variant?.url || null;
 }
 
 async function upsertChunked(records, log) {
@@ -135,6 +141,7 @@ export default async function handler(req, res) {
   let inserted = 0;
   let deactivated = 0;
   let skipped = 0;
+  let totalFetched = 0;
 
   try {
     log.push(`Ingest started: ${startedAt}`);
@@ -147,7 +154,9 @@ export default async function handler(req, res) {
 
     let cursor = null;
     let pageCount = 0;
-    const MAX_PAGES = 3; // Keep at 3 for now to confirm saves work, then increase
+    // 50 pages × 100 tours = 5000 tours per run
+    // With ~50% inactive, we'll process ~2500 active tours per run
+    const MAX_PAGES = 50;
 
     do {
       let url;
@@ -163,23 +172,18 @@ export default async function handler(req, res) {
       const products = data.products || [];
       cursor = data.nextCursor || null;
       pageCount++;
-
-      // Debug first page — log raw destinations so we can verify filter is working
-      if (pageCount === 1 && products.length > 0) {
-        const sample = products.slice(0, 3).map(t => ({
-          code: t.productCode,
-          destinations: t.destinations,
-        }));
-        log.push(`Page 1 sample destinations: ${JSON.stringify(sample)}`);
-      }
+      totalFetched += products.length;
 
       const upsertBatch = [];
 
       for (const tour of products) {
-        if (tour.status === 'INACTIVE' || tour.status === 'DEACTIVATED') {
+        // Skip inactive — they only return 4 fields, nothing useful
+        if (tour.status !== 'ACTIVE') {
           deactivated++;
           continue;
         }
+
+        // Filter to Japan only
         if (!isJapanTour(tour)) {
           skipped++;
           continue;
@@ -193,7 +197,7 @@ export default async function handler(req, res) {
           title: tour.title || null,
           description: tour.description || null,
           duration_minutes: extractDuration(tour),
-          max_group_size: extractMaxGroupSize(tour.pricingDetails),
+          max_group_size: extractMaxGroupSize(tour.pricingInfo),
           price_jpy: priceJpy,
           price_usd: priceUsd,
           rating: tour.reviews?.combinedAverageRating || null,
@@ -209,15 +213,19 @@ export default async function handler(req, res) {
         });
       }
 
-      log.push(`Page ${pageCount}: ${products.length} fetched, ${upsertBatch.length} Japan, ${skipped} skipped so far`);
-
       if (upsertBatch.length > 0) {
         const saved = await upsertChunked(upsertBatch, log);
         inserted += saved;
-        log.push(`Saved ${saved} to Supabase`);
+      }
+
+      // Log every 10 pages
+      if (pageCount % 10 === 0) {
+        log.push(`Page ${pageCount}: ${totalFetched} fetched total, ${inserted} Japan saved, ${deactivated} inactive, ${skipped} non-Japan`);
       }
 
     } while (cursor && pageCount < MAX_PAGES);
+
+    log.push(`Done. Pages: ${pageCount}, Fetched: ${totalFetched}, Saved: ${inserted}, Inactive: ${deactivated}, Non-Japan: ${skipped}`);
 
     await setLastIngestTimestamp(startedAt);
 
@@ -225,9 +233,10 @@ export default async function handler(req, res) {
       success: true,
       first_run: isFirstRun,
       pages_fetched: pageCount,
+      total_fetched: totalFetched,
       upserted: inserted,
-      deactivated,
-      skipped_non_japan: skipped,
+      inactive_skipped: deactivated,
+      non_japan_skipped: skipped,
       log,
     });
 
