@@ -1,6 +1,5 @@
 // /api/ingest-tours.js
 // Vercel daily cron — pulls Japan tours from Viator → saves to Supabase tours_raw
-// Saves cursor after every page so runs can resume if they timeout
 
 const VIATOR_BASE = 'https://api.viator.com/partner';
 const VIATOR_KEY = process.env.VIATOR_API_KEY;
@@ -46,7 +45,13 @@ async function viatorGet(path) {
     const err = await res.text();
     throw new Error(`Viator error ${res.status}: ${err}`);
   }
-  return res.json();
+  // Read as text first to catch truncated responses
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new Error(`Viator response truncated or invalid JSON (${text.length} chars): ${text.substring(0, 200)}`);
+  }
 }
 
 async function viatorPost(path, body) {
@@ -68,7 +73,6 @@ async function viatorPost(path, body) {
   return res.json();
 }
 
-// Get current ingest state — cursor + timestamp
 async function getIngestState() {
   try {
     const rows = await supabase('/ingest_meta?select=last_ingested_at,cursor&limit=1');
@@ -85,7 +89,7 @@ async function getIngestState() {
   return { isFirstRun: true, lastIngestedAt: null, savedCursor: null };
 }
 
-// Save cursor after each page so we can resume
+// Only save state after a SUCCESSFUL page fetch
 async function saveState(ts, cursor) {
   await supabase('/ingest_meta', 'POST', {
     id: 1,
@@ -146,33 +150,30 @@ export default async function handler(req, res) {
   try {
     log.push(`Ingest started: ${startedAt}`);
 
-    // Add cursor column to ingest_meta if needed
     const { isFirstRun, lastIngestedAt, savedCursor } = await getIngestState();
     log.push(`First run: ${isFirstRun}, resuming from cursor: ${savedCursor ? 'yes' : 'no'}`);
 
     const jpyRate = await getJpyToUsdRate();
     log.push(`JPY→USD rate: ${jpyRate}`);
 
-    let cursor = savedCursor; // Resume from saved cursor if exists
+    let cursor = savedCursor;
     let pageCount = 0;
     const MAX_PAGES = 50;
 
     do {
       let url;
       if (!cursor && isFirstRun) {
-        // Very first request ever — no cursor, no modifiedSince
         url = `/products/modified-since?count=20`;
       } else if (!cursor && !isFirstRun) {
-        // Delta update — use modifiedSince
         url = `/products/modified-since?count=20&modifiedSince=${encodeURIComponent(lastIngestedAt)}`;
       } else {
-        // Resume from saved cursor
         url = `/products/modified-since?count=20&cursor=${encodeURIComponent(cursor)}`;
       }
 
+      // Fetch page — if this fails, we don't save cursor (so next run retries same position)
       const data = await viatorGet(url);
       const products = data.products || [];
-      cursor = data.nextCursor || null;
+      const nextCursor = data.nextCursor || null;
       pageCount++;
       totalFetched += products.length;
 
@@ -217,7 +218,8 @@ export default async function handler(req, res) {
         inserted += saved;
       }
 
-      // Save cursor after every page so we can resume if we timeout
+      // Only save cursor AFTER successful page processing
+      cursor = nextCursor;
       await saveState(startedAt, cursor);
 
       if (pageCount % 10 === 0) {
@@ -226,10 +228,9 @@ export default async function handler(req, res) {
 
     } while (cursor && pageCount < MAX_PAGES);
 
-    // If no more cursor, initial seed is complete — clear cursor
     if (!cursor) {
       await saveState(startedAt, null);
-      log.push('Initial seed complete — cursor cleared');
+      log.push('Catalog fully ingested — cursor cleared');
     }
 
     log.push(`Done. Pages: ${pageCount}, Fetched: ${totalFetched}, Saved: ${inserted}, Inactive: ${deactivated}, Non-Japan: ${skipped}`);
