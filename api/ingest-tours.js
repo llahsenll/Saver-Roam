@@ -164,16 +164,16 @@ export default async function handler(req, res) {
     log.push(`JPY→USD rate: ${jpyRate}`);
 
     let cursor = savedCursor;
-    const MAX_PAGES = 2;
+    const MAX_PAGES = 50;
 
     do {
       let url;
       if (!cursor && isFirstRun) {
-        url = `/products/modified-since?count=20`;
+        url = `/products/modified-since?count=50`;
       } else if (!cursor && !isFirstRun) {
-        url = `/products/modified-since?count=20&modifiedSince=${encodeURIComponent(lastIngestedAt)}`;
+        url = `/products/modified-since?count=50&modifiedSince=${encodeURIComponent(lastIngestedAt)}`;
       } else {
-        url = `/products/modified-since?count=20&cursor=${encodeURIComponent(cursor)}`;
+        url = `/products/modified-since?count=50&cursor=${encodeURIComponent(cursor)}`;
       }
 
       // Fetch page — if this fails, we don't save cursor (so next run retries same position)
