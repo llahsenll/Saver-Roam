@@ -161,13 +161,13 @@ export default async function handler(req, res) {
       let url;
       if (!cursor && isFirstRun) {
         // Very first request ever — no cursor, no modifiedSince
-        url = `/products/modified-since?count=100`;
+        url = `/products/modified-since?count=20`;
       } else if (!cursor && !isFirstRun) {
         // Delta update — use modifiedSince
-        url = `/products/modified-since?count=100&modifiedSince=${encodeURIComponent(lastIngestedAt)}`;
+        url = `/products/modified-since?count=20&modifiedSince=${encodeURIComponent(lastIngestedAt)}`;
       } else {
         // Resume from saved cursor
-        url = `/products/modified-since?count=100&cursor=${encodeURIComponent(cursor)}`;
+        url = `/products/modified-since?count=20&cursor=${encodeURIComponent(cursor)}`;
       }
 
       const data = await viatorGet(url);
