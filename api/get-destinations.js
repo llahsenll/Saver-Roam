@@ -1,6 +1,5 @@
 // /api/get-destinations.js
-// One-off test — fetches Japan destination IDs from Viator
-// Delete this file after you have the IDs
+// Gets all Japan destination IDs (country + all cities/regions)
 
 const VIATOR_BASE = 'https://api.viator.com/partner';
 const VIATOR_KEY = process.env.VIATOR_API_KEY;
@@ -25,28 +24,20 @@ export default async function handler(req, res) {
     const data = await response.json();
     const destinations = data.destinations || [];
 
-    // Filter to Japan-related destinations only
-    const japan = destinations.filter(d =>
-      d.name?.toLowerCase().includes('japan') ||
-      d.parentId === 'japan' ||
-      JSON.stringify(d).toLowerCase().includes('japan') ||
-      // Also grab by known country code
-      d.type === 'COUNTRY' && d.name === 'Japan'
-    );
+    // Japan country ID is 16
+    const JAPAN_ID = 16;
 
-    // Also grab anything under Japan (cities, regions)
-    const japanCountry = destinations.find(d => d.name === 'Japan' && d.type === 'COUNTRY');
-    const japanChildren = japanCountry
-      ? destinations.filter(d => d.parentId === japanCountry.destinationId || d.parentId === String(japanCountry.destinationId))
-      : [];
+    // Get all destinations that are children of Japan
+    const japanChildren = destinations.filter(d => d.parentDestinationId === JAPAN_ID);
+
+    // All Japan destination IDs (country + all cities/regions)
+    const allJapanIds = [JAPAN_ID, ...japanChildren.map(d => d.destinationId)];
 
     return res.status(200).json({
-      total_destinations: destinations.length,
-      japan_country: japanCountry || null,
-      japan_related: japan,
-      japan_cities_regions: japanChildren,
-      // Raw sample so we can see the data structure
-      sample_raw: destinations.slice(0, 3),
+      japan_id: JAPAN_ID,
+      total_japan_destinations: allJapanIds.length,
+      all_japan_ids: allJapanIds,
+      japan_cities: japanChildren.map(d => ({ id: d.destinationId, name: d.name, type: d.type })),
     });
 
   } catch (error) {
