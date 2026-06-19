@@ -26,6 +26,7 @@ Claude scores tours in chat → you paste the result here → it saves to Airtab
    - Value: your Airtable personal access token
 5. Click **Deploy**
 6. After ~30s you get a live URL like `https://roam-saver.vercel.app`
+7. Tiny edit
 
 ### 3. Use it
 1. Paste a tour into your Claude chat → Claude gives you a scorecard JSON block
