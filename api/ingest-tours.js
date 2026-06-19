@@ -1,16 +1,14 @@
 // /api/ingest-tours.js
 // Vercel daily cron — pulls Japan tours from Viator → saves to Supabase tours_raw
-// Runs daily at 2am UTC via vercel.json cron config
 
 const VIATOR_BASE = 'https://api.viator.com/partner';
 const VIATOR_KEY = process.env.VIATOR_API_KEY;
-const SUPABASE_URL = process.env.SUPABASE_URL; // https://yejleykbjsdjwhjmuwsw.supabase.co/rest/v1
+const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
-// Japan destination IDs on Viator
-const JAPAN_DESTINATION_IDS = ['334', '479', '480', '481', '482', '483'];
+// Japan destination IDs — we'll log what we actually see and filter broadly
+const JAPAN_DEST_IDS = ['334', '479', '480', '481', '482', '483'];
 
-// Supabase REST helper
 async function supabase(path, method = 'GET', body = null) {
   const res = await fetch(`${SUPABASE_URL}${path}`, {
     method,
@@ -30,7 +28,6 @@ async function supabase(path, method = 'GET', body = null) {
   return res.json();
 }
 
-// Viator GET helper — /products/modified-since is a GET with query params
 async function viatorGet(path) {
   const res = await fetch(`${VIATOR_BASE}${path}`, {
     method: 'GET',
@@ -48,7 +45,6 @@ async function viatorGet(path) {
   return res.json();
 }
 
-// Viator POST helper — for exchange-rates
 async function viatorPost(path, body) {
   const res = await fetch(`${VIATOR_BASE}${path}`, {
     method: 'POST',
@@ -68,7 +64,6 @@ async function viatorPost(path, body) {
   return res.json();
 }
 
-// Check if ingest_meta has a cursor saved (means initial ingestion already started)
 async function getIngestState() {
   try {
     const rows = await supabase('/ingest_meta?select=last_ingested_at&limit=1');
@@ -76,7 +71,7 @@ async function getIngestState() {
       return { isFirstRun: false, lastIngestedAt: rows[0].last_ingested_at };
     }
   } catch (e) {
-    console.log('No ingest_meta found — first run');
+    console.log('No ingest_meta — first run');
   }
   return { isFirstRun: true, lastIngestedAt: null };
 }
@@ -85,7 +80,6 @@ async function setLastIngestTimestamp(ts) {
   await supabase('/ingest_meta', 'POST', { id: 1, last_ingested_at: ts });
 }
 
-// Get JPY→USD rate
 async function getJpyToUsdRate() {
   const data = await viatorPost('/exchange-rates', { targetCurrency: 'USD' });
   const rate = data.rates?.find(r => r.sourceCurrency === 'JPY' && r.targetCurrency === 'USD');
@@ -108,9 +102,26 @@ function extractDuration(tour) {
 }
 
 function isJapanTour(tour) {
-  const destId = String(tour.destinations?.[0]?.ref || '');
-  return JAPAN_DESTINATION_IDS.some(id => destId.startsWith(id)) ||
-    JSON.stringify(tour.destinations || '').includes('Japan');
+  const destStr = JSON.stringify(tour.destinations || []);
+  // Match any Japan destination ID or "Japan" text in destinations
+  return JAPAN_DEST_IDS.some(id => destStr.includes(`"${id}"`) || destStr.includes(`'${id}'`)) ||
+    destStr.toLowerCase().includes('japan');
+}
+
+// Upsert in small chunks to avoid Supabase payload limits
+async function upsertChunked(records, log) {
+  const CHUNK_SIZE = 25;
+  let saved = 0;
+  for (let i = 0; i < records.length; i += CHUNK_SIZE) {
+    const chunk = records.slice(i, i + CHUNK_SIZE);
+    try {
+      await supabase('/tours_raw', 'POST', chunk);
+      saved += chunk.length;
+    } catch (e) {
+      log.push(`Chunk upsert error: ${e.message}`);
+    }
+  }
+  return saved;
 }
 
 export default async function handler(req, res) {
@@ -126,28 +137,21 @@ export default async function handler(req, res) {
     const { isFirstRun, lastIngestedAt } = await getIngestState();
     log.push(`First run: ${isFirstRun}`);
 
-    // Get JPY→USD rate
     const jpyRate = await getJpyToUsdRate();
     log.push(`JPY→USD rate: ${jpyRate}`);
 
-    // Paginate through /products/modified-since
-    // First run: only send count=500 (no modifiedSince, no cursor) per Viator docs
-    // Subsequent runs: send modifiedSince= last timestamp
     let cursor = null;
     let pageCount = 0;
-    const MAX_PAGES = 50;
+    const MAX_PAGES = 3; // Small limit for testing — increase after confirmed working
 
     do {
       let url;
       if (pageCount === 0 && isFirstRun) {
-        // Initial ingestion — count only, no modifiedSince
-        url = `/products/modified-since?count=500`;
+        url = `/products/modified-since?count=100`;
       } else if (pageCount === 0 && !isFirstRun) {
-        // Delta update — use modifiedSince
-        url = `/products/modified-since?count=500&modifiedSince=${encodeURIComponent(lastIngestedAt)}`;
+        url = `/products/modified-since?count=100&modifiedSince=${encodeURIComponent(lastIngestedAt)}`;
       } else {
-        // Pagination — use cursor only
-        url = `/products/modified-since?count=500&cursor=${encodeURIComponent(cursor)}`;
+        url = `/products/modified-since?count=100&cursor=${encodeURIComponent(cursor)}`;
       }
 
       const data = await viatorGet(url);
@@ -155,27 +159,25 @@ export default async function handler(req, res) {
       cursor = data.nextCursor || null;
       pageCount++;
 
-      log.push(`Page ${pageCount}: ${products.length} products, hasMore=${!!cursor}`);
+      // Debug: log destination IDs from first page so we can verify Japan filter
+      if (pageCount === 1) {
+        const sampleDests = products.slice(0, 5).map(t => ({
+          code: t.productCode,
+          dests: t.destinations?.map(d => d.ref) || []
+        }));
+        log.push(`Sample destinations page 1: ${JSON.stringify(sampleDests)}`);
+      }
 
       const upsertBatch = [];
 
       for (const tour of products) {
-        if (!isJapanTour(tour)) {
-          skipped++;
+        if (tour.status === 'INACTIVE' || tour.status === 'DEACTIVATED') {
+          deactivated++;
           continue;
         }
 
-        if (tour.status === 'INACTIVE' || tour.status === 'DEACTIVATED') {
-          try {
-            await supabase(
-              `/tours_raw?product_code=eq.${tour.productCode}`,
-              'PATCH',
-              { viator_status: 'INACTIVE', modified_at: new Date().toISOString() }
-            );
-            deactivated++;
-          } catch (e) {
-            console.error('Failed to deactivate:', tour.productCode, e.message);
-          }
+        if (!isJapanTour(tour)) {
+          skipped++;
           continue;
         }
 
@@ -203,25 +205,20 @@ export default async function handler(req, res) {
         });
       }
 
+      log.push(`Page ${pageCount}: ${products.length} fetched, ${upsertBatch.length} Japan, ${skipped} skipped`);
+
       if (upsertBatch.length > 0) {
-        await supabase('/tours_raw', 'POST', upsertBatch);
-        inserted += upsertBatch.length;
-        log.push(`Upserted ${upsertBatch.length} Japan tours`);
+        const saved = await upsertChunked(upsertBatch, log);
+        inserted += saved;
+        log.push(`Saved ${saved} to Supabase`);
       }
 
-      // Safety: stop after MAX_PAGES pages on first run (resume next day via cursor)
-      if (pageCount >= MAX_PAGES) {
-        log.push(`Hit MAX_PAGES limit (${MAX_PAGES}). Will continue tomorrow.`);
-        break;
-      }
-
-    } while (cursor);
+    } while (cursor && pageCount < MAX_PAGES);
 
     await setLastIngestTimestamp(startedAt);
 
     return res.status(200).json({
       success: true,
-      started_at: startedAt,
       first_run: isFirstRun,
       pages_fetched: pageCount,
       upserted: inserted,
