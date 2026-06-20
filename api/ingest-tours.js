@@ -125,6 +125,27 @@ async function saveState(ts, cursor) {
   });
 }
 
+// --- Concurrency lock -------------------------------------------------------
+// Prevents two overlapping runs of THIS script from racing on the same cursor.
+// Stale-after 70s (longer than the 55s time budget) so a crashed run can't
+// permanently block future runs.
+const LOCK_STALE_MS = 70000;
+
+async function acquireLock() {
+  const rows = await supabase('/ingest_meta?select=tours_lock_at&id=eq.1');
+  const lockAt = rows?.[0]?.tours_lock_at ? new Date(rows[0].tours_lock_at).getTime() : null;
+  if (lockAt && (Date.now() - lockAt) < LOCK_STALE_MS) {
+    return false; // another run is actively in progress
+  }
+  await supabase('/ingest_meta', 'POST', { id: 1, tours_lock_at: new Date().toISOString() });
+  return true;
+}
+
+async function releaseLock() {
+  await supabase('/ingest_meta', 'POST', { id: 1, tours_lock_at: null });
+}
+// -----------------------------------------------------------------------------
+
 function extractMaxGroupSize(pricingInfo) {
   if (!pricingInfo?.ageBands) return null;
   const adultBands = pricingInfo.ageBands.filter(p => p.ageBand === 'ADULT');
@@ -147,29 +168,54 @@ function isJapanTour(tour) {
 
 async function upsertChunked(records, log) {
   const CHUNK_SIZE = 25;
-  let saved = 0;
+  let newInserted = 0;
+  let updatedExisting = 0;
   for (let i = 0; i < records.length; i += CHUNK_SIZE) {
     const chunk = records.slice(i, i + CHUNK_SIZE);
+    const codes = chunk.map(r => r.product_code);
     try {
+      // Check which of these codes already exist BEFORE upserting, so the
+      // summary can report "actually new" vs "already had this one" instead
+      // of one ambiguous combined number.
+      const inList = codes.map(c => encodeURIComponent(c)).join(',');
+      const existing = await supabase(`/tours_raw?select=product_code&product_code=in.(${inList})`);
+      const existingSet = new Set((existing || []).map(r => r.product_code));
+
       await supabase('/tours_raw', 'POST', chunk);
-      saved += chunk.length;
+
+      for (const code of codes) {
+        if (existingSet.has(code)) updatedExisting++;
+        else newInserted++;
+      }
     } catch (e) {
       log.push(`Chunk upsert error: ${e.message}`);
     }
   }
-  return saved;
+  return { newInserted, updatedExisting };
 }
 
 export default async function handler(req, res) {
   const startedAt = new Date().toISOString();
   const log = [];
-  let inserted = 0;
+  let newInserted = 0;
+  let updatedExisting = 0;
   let deactivated = 0;
   let skipped = 0;
   let totalFetched = 0;
   let pageCount = 0;
+  let lockAcquired = false;
 
   try {
+    lockAcquired = await acquireLock();
+    if (!lockAcquired) {
+      res.setHeader('Content-Type', 'application/json');
+      return res.status(409).send(JSON.stringify({
+        success: false,
+        already_running: true,
+        error: 'Another ingest-tours run is still in progress (started within the last 70s). Wait for it to finish, then try again.',
+      }));
+    }
+
     log.push(`Ingest started: ${startedAt}`);
 
     const { isFirstRun, lastIngestedAt, savedCursor } = await getIngestState();
@@ -232,8 +278,9 @@ export default async function handler(req, res) {
       }
 
       if (upsertBatch.length > 0) {
-        const saved = await upsertChunked(upsertBatch, log);
-        inserted += saved;
+        const result = await upsertChunked(upsertBatch, log);
+        newInserted += result.newInserted;
+        updatedExisting += result.updatedExisting;
       }
 
       // Only save cursor AFTER successful page processing
@@ -241,7 +288,7 @@ export default async function handler(req, res) {
       await saveState(startedAt, cursor);
 
       if (pageCount % 10 === 0) {
-        log.push(`Page ${pageCount}: ${totalFetched} fetched, ${inserted} Japan saved, ${deactivated} inactive, ${skipped} non-Japan`);
+        log.push(`Page ${pageCount}: ${totalFetched} fetched, ${newInserted} new, ${updatedExisting} updated, ${deactivated} inactive, ${skipped} non-Japan`);
       }
 
     } while (cursor && pageCount < MAX_PAGES && (Date.now() - new Date(startedAt).getTime()) < TIME_BUDGET_MS);
@@ -251,14 +298,15 @@ export default async function handler(req, res) {
       log.push('Catalog fully ingested — cursor cleared');
     }
 
-    log.push(`Done. Pages: ${pageCount}, Fetched: ${totalFetched}, Saved: ${inserted}, Inactive: ${deactivated}, Non-Japan: ${skipped}`);
+    log.push(`Done. Pages: ${pageCount}, Fetched: ${totalFetched}, New: ${newInserted}, Updated: ${updatedExisting}, Inactive: ${deactivated}, Non-Japan: ${skipped}`);
 
     const summary = {
       success: true,
       first_run: isFirstRun,
       pages_fetched: pageCount,
       total_fetched: totalFetched,
-      upserted: inserted,
+      new_tours_inserted: newInserted,
+      existing_tours_updated: updatedExisting,
       inactive_skipped: deactivated,
       non_japan_skipped: skipped,
       has_more: !!cursor,
@@ -272,9 +320,14 @@ export default async function handler(req, res) {
       success: false,
       error: String(error.message || error),
       pages_fetched: pageCount,
-      upserted: inserted,
+      new_tours_inserted: newInserted,
+      existing_tours_updated: updatedExisting,
     };
     res.setHeader('Content-Type', 'application/json');
     return res.status(500).send(JSON.stringify(errSummary));
+  } finally {
+    if (lockAcquired) {
+      await releaseLock().catch(() => {}); // best-effort cleanup, never throw from here
+    }
   }
 }
