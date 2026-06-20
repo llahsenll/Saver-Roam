@@ -61,6 +61,40 @@ async function getExchangeRates() {
   return rateMap;
 }
 
+// --- Concurrency lock -------------------------------------------------------
+// Own lock column, completely separate from ingest-tours.js's lock — these two
+// scripts are independent pipelines and never block each other. This only
+// prevents two overlapping runs of THIS script. Stale-after 70s (longer than
+// the 55s time budget) so a crashed run can't permanently block future runs.
+const LOCK_STALE_MS = 70000;
+
+async function acquireLock() {
+  const rows = await sbFetchJson(
+    `${SUPABASE_URL}/ingest_meta?select=availability_lock_at&id=eq.1`,
+    { headers: sbHeaders() }
+  );
+  const lockAtRaw = rows?.[0]?.availability_lock_at;
+  const lockAt = lockAtRaw ? new Date(lockAtRaw).getTime() : null;
+  if (lockAt && (Date.now() - lockAt) < LOCK_STALE_MS) {
+    return false; // another run is actively in progress
+  }
+  await fetch(`${SUPABASE_URL}/ingest_meta?id=eq.1`, {
+    method: 'PATCH',
+    headers: sbHeaders({ Prefer: 'return=minimal' }),
+    body: JSON.stringify({ availability_lock_at: new Date().toISOString() }),
+  });
+  return true;
+}
+
+async function releaseLock() {
+  await fetch(`${SUPABASE_URL}/ingest_meta?id=eq.1`, {
+    method: 'PATCH',
+    headers: sbHeaders({ Prefer: 'return=minimal' }),
+    body: JSON.stringify({ availability_lock_at: null }),
+  });
+}
+// -----------------------------------------------------------------------------
+
 export default async function handler(req, res) {
   const startTime = Date.now();
   let pageCount = 0;
@@ -69,8 +103,18 @@ export default async function handler(req, res) {
   let updatedCount = 0;
   let skippedNoPriceCount = 0;
   let skippedNoRateCount = 0;
+  let lockAcquired = false;
 
   try {
+    lockAcquired = await acquireLock();
+    if (!lockAcquired) {
+      return res.status(409).json({
+        success: false,
+        already_running: true,
+        error: 'Another ingest-availability run is still in progress (started within the last 70s). Wait for it to finish, then try again.',
+      });
+    }
+
     // 1. Load meta row
     const metaRows = await sbFetchJson(
       `${SUPABASE_URL}/ingest_meta?select=id,availability_cursor,availability_last_synced_at&id=eq.1`,
@@ -200,5 +244,9 @@ export default async function handler(req, res) {
       matched_existing_tours: matchedCount,
       updated: updatedCount,
     });
+  } finally {
+    if (lockAcquired) {
+      await releaseLock().catch(() => {}); // best-effort cleanup, never throw from here
+    }
   }
 }
