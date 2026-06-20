@@ -1,5 +1,11 @@
 // /api/ingest-tours.js
 // Vercel daily cron — pulls Japan tours from Viator → saves to Supabase tours_raw
+//
+// NOTE: price_jpy / price_usd / price_currency are NOT touched by this script.
+// Pricing is owned exclusively by ingest-availability.js (the only Viator-certified
+// path for bulk pricing). This script used to compute price via tour.pricingSummary
+// (a field that doesn't exist on this endpoint, see build log) and would have
+// overwritten good prices back to null on every re-save. Removed entirely.
 
 const VIATOR_BASE = 'https://api.viator.com/partner';
 const VIATOR_KEY = process.env.VIATOR_API_KEY;
@@ -11,6 +17,40 @@ const JAPAN_DEST_IDS = new Set([
   50155,50158,50157,50168,50176,50175,50178,50177,50179,50181,50180,50183,
   50182,50185,50184,50187,50186,50188,50190,50149,50148,25611,23404
 ]);
+
+// --- Image trimming -------------------------------------------------------
+// Viator returns ~10 size variants per photo. We only ever need 2 on the
+// site (a card/grid size and a larger detail/hero size), so we throw the
+// rest away before storing. Cuts the images field by roughly 70-80%.
+const CARD_TARGET_WIDTH = 400;
+const HERO_TARGET_WIDTH = 720;
+
+function pickClosestVariant(variants, targetWidth) {
+  if (!variants || !variants.length) return null;
+  return variants.reduce((best, v) => {
+    if (!best) return v;
+    return Math.abs(v.width - targetWidth) < Math.abs(best.width - targetWidth) ? v : best;
+  }, null);
+}
+
+function trimImages(images) {
+  if (!images || !Array.isArray(images)) return null;
+  return images.map(img => {
+    const variants = img.variants || [];
+    const card = pickClosestVariant(variants, CARD_TARGET_WIDTH);
+    const hero = pickClosestVariant(variants, HERO_TARGET_WIDTH);
+    const trimmedVariants = [];
+    if (card) trimmedVariants.push(card);
+    if (hero && hero.url !== card?.url) trimmedVariants.push(hero);
+    return {
+      imageSource: img.imageSource,
+      caption: img.caption,
+      isCover: img.isCover,
+      variants: trimmedVariants,
+    };
+  });
+}
+// ---------------------------------------------------------------------------
 
 async function supabase(path, method = 'GET', body = null) {
   const res = await fetch(`${SUPABASE_URL}${path}`, {
@@ -60,25 +100,6 @@ async function viatorGet(path) {
   }
 }
 
-async function viatorPost(path, body) {
-  const res = await fetch(`${VIATOR_BASE}${path}`, {
-    method: 'POST',
-    headers: {
-      'exp-api-key': VIATOR_KEY,
-      'Accept': 'application/json;version=2.0',
-      'Accept-Language': 'en-US',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120000),
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Viator error ${res.status}: ${err}`);
-  }
-  return res.json();
-}
-
 async function getIngestState() {
   try {
     const rows = await supabase('/ingest_meta?select=last_ingested_at,cursor&limit=1');
@@ -102,12 +123,6 @@ async function saveState(ts, cursor) {
     last_ingested_at: ts,
     cursor: cursor || null,
   });
-}
-
-async function getJpyToUsdRate() {
-  const data = await viatorPost('/exchange-rates', { targetCurrency: 'USD' });
-  const rate = data.rates?.find(r => r.sourceCurrency === 'JPY' && r.targetCurrency === 'USD');
-  return rate ? rate.rate : null;
 }
 
 function extractMaxGroupSize(pricingInfo) {
@@ -160,9 +175,6 @@ export default async function handler(req, res) {
     const { isFirstRun, lastIngestedAt, savedCursor } = await getIngestState();
     log.push(`First run: ${isFirstRun}, resuming from cursor: ${savedCursor ? 'yes' : 'no'}`);
 
-    const jpyRate = await getJpyToUsdRate();
-    log.push(`JPY→USD rate: ${jpyRate}`);
-
     let cursor = savedCursor;
     const MAX_PAGES = 1000; // Safety ceiling — real limit is the time budget below
     const TIME_BUDGET_MS = 55000; // Stop just under Vercel's 60s timeout, save cursor, return
@@ -196,20 +208,19 @@ export default async function handler(req, res) {
           continue;
         }
 
-        const priceJpy = tour.pricingSummary?.fromPrice || null;
-        const priceUsd = priceJpy && jpyRate ? Math.round(priceJpy * jpyRate * 100) / 100 : null;
-
         upsertBatch.push({
           product_code: tour.productCode,
           title: tour.title || null,
           description: tour.description || null,
           duration_minutes: extractDuration(tour),
           max_group_size: extractMaxGroupSize(tour.pricingInfo),
-          price_jpy: priceJpy,
-          price_usd: priceUsd,
+          // price_jpy / price_usd / price_currency intentionally omitted —
+          // owned by ingest-availability.js. Omitting the keys (not setting
+          // them to null) means Supabase's upsert leaves existing price data
+          // untouched on conflict instead of clobbering it.
           rating: tour.reviews?.combinedAverageRating || null,
           review_count: tour.reviews?.totalReviews || null,
-          images: tour.images ? JSON.stringify(tour.images) : null,
+          images: tour.images ? JSON.stringify(trimImages(tour.images)) : null,
           inclusions: tour.inclusions ? JSON.stringify(tour.inclusions) : null,
           tags: tour.tags ? JSON.stringify(tour.tags) : null,
           destination_id: tour.destinations?.[0]?.ref || null,
