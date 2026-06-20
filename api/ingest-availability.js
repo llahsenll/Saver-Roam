@@ -50,7 +50,11 @@ async function getExchangeRates() {
   const data = text ? JSON.parse(text) : null;
   const rateMap = {};
   (data?.rates || []).forEach(entry => {
-    if (entry?.sourceCurrency && typeof entry.rate === 'number') {
+    // CRITICAL: the response contains one entry per (sourceCurrency, targetCurrency) pair,
+    // e.g. JPY->CLP, JPY->EUR, JPY->PEN, JPY->USD all exist simultaneously. Must filter by
+    // targetCurrency === 'USD' or this silently grabs whichever JPY-source entry happens to
+    // appear last in the array (bug found 2026-06-20: was grabbing JPY->PEN instead of JPY->USD).
+    if (entry?.sourceCurrency && entry?.targetCurrency === 'USD' && typeof entry.rate === 'number') {
       rateMap[entry.sourceCurrency] = entry.rate;
     }
   });
@@ -153,6 +157,7 @@ export default async function handler(req, res) {
               body: JSON.stringify({
                 price_jpy: fromPrice,
                 price_usd: priceUsd,
+                price_currency: currency,
               }),
             }
           );
