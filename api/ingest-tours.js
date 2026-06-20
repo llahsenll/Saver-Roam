@@ -223,7 +223,7 @@ export default async function handler(req, res) {
 
     let cursor = savedCursor;
     const MAX_PAGES = 1000; // Safety ceiling — real limit is the time budget below
-    const TIME_BUDGET_MS = 55000; // Stop just under Vercel's 60s timeout, save cursor, return
+    const TIME_BUDGET_MS = 25000; // Sized to fit under cron-job.org free tier's 30s request timeout cap
 
     do {
       let url;
