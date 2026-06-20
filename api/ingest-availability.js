@@ -17,7 +17,7 @@ const VIATOR_KEY = process.env.VIATOR_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
-const TIME_BUDGET_MS = 55000;
+const TIME_BUDGET_MS = 25000; // Sized to fit under cron-job.org free tier's 30s request timeout cap
 const PAGE_COUNT = 500;
 
 function sbHeaders(extra = {}) {
