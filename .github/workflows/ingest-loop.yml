@@ -17,14 +17,14 @@ jobs:
 
           loop_tours() {
             while [ $(date +%s) -lt $END_TIME ]; do
-              curl -s -m 65 "$BASE_URL/api/ingest-tours" -w "\nstatus: %{http_code}\n\n"
+              curl -s -m 65 "$BASE_URL/api/ingest-tours" -w "\nstatus: %{http_code}\n\n" || echo "request failed, retrying next cycle"
               sleep 2
             done
           }
 
           loop_availability() {
             while [ $(date +%s) -lt $END_TIME ]; do
-              curl -s -m 65 "$BASE_URL/api/ingest-availability" -w "\nstatus: %{http_code}\n\n"
+              curl -s -m 65 "$BASE_URL/api/ingest-availability" -w "\nstatus: %{http_code}\n\n" || echo "request failed, retrying next cycle"
               sleep 2
             done
           }
