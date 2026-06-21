@@ -223,7 +223,7 @@ export default async function handler(req, res) {
 
     let cursor = savedCursor;
     const MAX_PAGES = 1000; // Safety ceiling — real limit is the time budget below
-    const TIME_BUDGET_MS = 25000; // Sized to fit under cron-job.org free tier's 30s request timeout cap
+    const TIME_BUDGET_MS = 55000; // GitHub Actions has no proxy timeout — sized to Vercel's ~60s function ceiling instead
 
     do {
       let url;
