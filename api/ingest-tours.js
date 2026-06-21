@@ -329,6 +329,14 @@ export default async function handler(req, res) {
       non_japan_skipped: skipped,
       has_more: !!cursor,
     };
+    // Release the lock BEFORE responding. The client (curl loop) considers
+    // the request "done" the instant it gets a response, and may fire the
+    // next call within 2 seconds. If the lock release was still in-flight
+    // at that point, the next call would wrongly see the lock as held and
+    // get a 409 -- even though the actual work was already finished.
+    await releaseLock().catch(() => {});
+    lockAcquired = false;
+
     res.setHeader('Content-Type', 'application/json');
     return res.status(200).send(JSON.stringify(summary));
 
@@ -341,6 +349,11 @@ export default async function handler(req, res) {
       new_tours_inserted: newInserted,
       existing_tours_updated: updatedExisting,
     };
+    if (lockAcquired) {
+      await releaseLock().catch(() => {});
+      lockAcquired = false;
+    }
+
     res.setHeader('Content-Type', 'application/json');
     return res.status(500).send(JSON.stringify(errSummary));
   } finally {
