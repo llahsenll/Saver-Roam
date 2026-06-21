@@ -30,5 +30,4 @@ jobs:
           }
 
           loop_tours &
-          loop_availability &
           wait
