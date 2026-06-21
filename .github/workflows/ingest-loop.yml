@@ -17,7 +17,7 @@ jobs:
 
           loop_tours() {
             while [ $(date +%s) -lt $END_TIME ]; do
-              curl -s -m 65 "$BASE_URL/api/ingest-tours" -o /dev/null -w "tours: %{http_code}\n"
+              curl -s -m 65 "$BASE_URL/api/ingest-tours" -w "\nstatus: %{http_code}\n\n"
               sleep 2
             done
           }
