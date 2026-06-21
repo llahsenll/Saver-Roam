@@ -18,6 +18,7 @@ async function saveOneRecord(d, apiKey) {
   setText("Name", d.name);
   setText("City", d.city);
   setText("Category", d.category);
+  setText("Secondary Category", d.secondary_category);
   setText("Price Tier", d.price_tier);
   setText("Duration", d.duration);
   setText("Group Type", d.group_type);
@@ -94,7 +95,7 @@ export default async function handler(req, res) {
     const results = [];
     for (const record of records) {
       results.push(await saveOneRecord(record, apiKey));
-      if (records.length > 1) await new Promise(r => setTimeout(r, 220));
+      if (records.length > 1) await new Promise(r => setTimeout(r, 250));
     }
 
     if (!isBatch) {
