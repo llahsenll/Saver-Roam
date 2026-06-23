@@ -12,14 +12,6 @@ const VIATOR_KEY = process.env.VIATOR_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
-// Full set of 150 destination IDs under Japan's taxonomy tree (country + all
-// regions/prefectures/cities/neighborhoods), pulled directly from Viator's
-// /destinations endpoint on 2026-06-21. The previous hardcoded list (36 IDs)
-// only covered some prefecture/region-level tags and was missing nearly every
-// city-level ID -- including Tokyo (334), Kyoto (332), Osaka (333), Yokohama,
-// Sapporo, Hiroshima, Nagoya, Fukuoka, Kobe, Nara, Hakone, Nikko, Kamakura,
-// Asakusa, Shibuya, etc. Since most products are tagged at the city level,
-// this was silently excluding the vast majority of real Japan tours.
 const JAPAN_DEST_IDS = new Set([
   16,332,333,334,4659,4660,4661,4663,4665,4666,4667,4668,
   4687,4691,4693,4697,4699,4701,5558,5559,5614,23311,23404,23523,
@@ -36,10 +28,6 @@ const JAPAN_DEST_IDS = new Set([
   51239,51459,52140,59194,60411,60446
 ]);
 
-// --- Image trimming -------------------------------------------------------
-// Viator returns ~10 size variants per photo. We only ever need 2 on the
-// site (a card/grid size and a larger detail/hero size), so we throw the
-// rest away before storing. Cuts the images field by roughly 70-80%.
 const CARD_TARGET_WIDTH = 400;
 const HERO_TARGET_WIDTH = 720;
 
@@ -68,7 +56,6 @@ function trimImages(images) {
     };
   });
 }
-// ---------------------------------------------------------------------------
 
 async function supabase(path, method = 'GET', body = null) {
   const res = await fetch(`${SUPABASE_URL}${path}`, {
@@ -109,7 +96,6 @@ async function viatorGet(path) {
     const err = await res.text();
     throw new Error(`Viator error ${res.status}: ${err}`);
   }
-  // Read as text first to catch truncated responses
   const text = await res.text();
   try {
     return JSON.parse(text);
@@ -134,7 +120,6 @@ async function getIngestState() {
   return { isFirstRun: true, lastIngestedAt: null, savedCursor: null };
 }
 
-// Only save state after a SUCCESSFUL page fetch
 async function saveState(ts, cursor) {
   await supabase('/ingest_meta', 'POST', {
     id: 1,
@@ -143,17 +128,13 @@ async function saveState(ts, cursor) {
   });
 }
 
-// --- Concurrency lock -------------------------------------------------------
-// Prevents two overlapping runs of THIS script from racing on the same cursor.
-// Stale-after 70s (longer than the 55s time budget) so a crashed run can't
-// permanently block future runs.
 const LOCK_STALE_MS = 70000;
 
 async function acquireLock() {
   const rows = await supabase('/ingest_meta?select=tours_lock_at&id=eq.1');
   const lockAt = rows?.[0]?.tours_lock_at ? new Date(rows[0].tours_lock_at).getTime() : null;
   if (lockAt && (Date.now() - lockAt) < LOCK_STALE_MS) {
-    return false; // another run is actively in progress
+    return false;
   }
   await supabase('/ingest_meta', 'POST', { id: 1, tours_lock_at: new Date().toISOString() });
   return true;
@@ -162,7 +143,6 @@ async function acquireLock() {
 async function releaseLock() {
   await supabase('/ingest_meta', 'POST', { id: 1, tours_lock_at: null });
 }
-// -----------------------------------------------------------------------------
 
 function extractMaxGroupSize(pricingInfo) {
   if (!pricingInfo?.ageBands) return null;
@@ -192,15 +172,10 @@ async function upsertChunked(records, log) {
     const chunk = records.slice(i, i + CHUNK_SIZE);
     const codes = chunk.map(r => r.product_code);
     try {
-      // Check which of these codes already exist BEFORE upserting, so the
-      // summary can report "actually new" vs "already had this one" instead
-      // of one ambiguous combined number.
       const inList = codes.map(c => encodeURIComponent(c)).join(',');
       const existing = await supabase(`/tours_raw?select=product_code&product_code=in.(${inList})`);
       const existingSet = new Set((existing || []).map(r => r.product_code));
-
       await supabase('/tours_raw', 'POST', chunk);
-
       for (const code of codes) {
         if (existingSet.has(code)) updatedExisting++;
         else newInserted++;
@@ -237,11 +212,11 @@ export default async function handler(req, res) {
     log.push(`Ingest started: ${startedAt}`);
 
     const { isFirstRun, lastIngestedAt, savedCursor } = await getIngestState();
-    log.push(`First run: ${isFirstRun}, resuming from cursor: ${savedCursor ? 'yes' : 'no'}`);
+    log.push(`First run: ${isFirstRun}, resuming from cursor: ${savedCursor ? 'yes' : 'no'}, modifiedSince: ${lastIngestedAt}`);
 
     let cursor = savedCursor;
-    const MAX_PAGES = 1000; // Safety ceiling — real limit is the time budget below
-    const TIME_BUDGET_MS = 55000; // GitHub Actions has no proxy timeout — sized to Vercel's ~60s function ceiling instead
+    const MAX_PAGES = 1000;
+    const TIME_BUDGET_MS = 55000;
 
     do {
       let url;
@@ -253,7 +228,9 @@ export default async function handler(req, res) {
         url = `/products/modified-since?count=50&cursor=${encodeURIComponent(cursor)}`;
       }
 
-      // Fetch page — if this fails, we don't save cursor (so next run retries same position)
+      // *** DEBUG LINE — shows exact URL being called ***
+      console.log('Calling Viator:', url);
+
       const data = await viatorGet(url);
       const products = data.products || [];
       const nextCursor = data.nextCursor || null;
@@ -278,10 +255,6 @@ export default async function handler(req, res) {
           description: tour.description || null,
           duration_minutes: extractDuration(tour),
           max_group_size: extractMaxGroupSize(tour.pricingInfo),
-          // price_jpy / price_usd / price_currency intentionally omitted —
-          // owned by ingest-availability.js. Omitting the keys (not setting
-          // them to null) means Supabase's upsert leaves existing price data
-          // untouched on conflict instead of clobbering it.
           rating: tour.reviews?.combinedAverageRating || null,
           review_count: tour.reviews?.totalReviews || null,
           images: tour.images ? JSON.stringify(trimImages(tour.images)) : null,
@@ -301,7 +274,6 @@ export default async function handler(req, res) {
         updatedExisting += result.updatedExisting;
       }
 
-      // Only save cursor AFTER successful page processing
       cursor = nextCursor;
       await saveState(startedAt, cursor);
 
@@ -329,11 +301,7 @@ export default async function handler(req, res) {
       non_japan_skipped: skipped,
       has_more: !!cursor,
     };
-    // Release the lock BEFORE responding. The client (curl loop) considers
-    // the request "done" the instant it gets a response, and may fire the
-    // next call within 2 seconds. If the lock release was still in-flight
-    // at that point, the next call would wrongly see the lock as held and
-    // get a 409 -- even though the actual work was already finished.
+
     await releaseLock().catch(() => {});
     lockAcquired = false;
 
@@ -353,12 +321,11 @@ export default async function handler(req, res) {
       await releaseLock().catch(() => {});
       lockAcquired = false;
     }
-
     res.setHeader('Content-Type', 'application/json');
     return res.status(500).send(JSON.stringify(errSummary));
   } finally {
     if (lockAcquired) {
-      await releaseLock().catch(() => {}); // best-effort cleanup, never throw from here
+      await releaseLock().catch(() => {});
     }
   }
 }
