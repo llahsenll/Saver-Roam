@@ -17,9 +17,6 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install dependencies
-        run: npm ci
-
       - name: Run tours ingestion
         env:
           VIATOR_API_KEY: ${{ secrets.VIATOR_API_KEY }}
