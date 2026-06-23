@@ -1,0 +1,9 @@
+{
+  "name": "saver-roam",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "ingest-tours": "node scripts/ingest-tours.js",
+    "ingest-availability": "node scripts/ingest-availability.js"
+  }
+}
