@@ -1,34 +1,29 @@
 name: Ingest Loop
-
 on:
   schedule:
     - cron: '0 */6 * * *'   # every 6 hours
   workflow_dispatch:         # lets you trigger it manually from the Actions tab
-
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 355      # stay under GitHub's 360min/6h default job cap
+    timeout-minutes: 10      # delta runs finish in seconds, no need for 355 mins
     steps:
       - name: Run ingestion loops
         run: |
           BASE_URL="https://saver-roam.vercel.app"
-          END_TIME=$(( $(date +%s) + 345*60 ))
-
+          END_TIME=$(( $(date +%s) + 5*60 ))
           loop_tours() {
             while [ $(date +%s) -lt $END_TIME ]; do
               curl -s -m 65 "$BASE_URL/api/ingest-tours" -w "\nstatus: %{http_code}\n\n" || echo "request failed, retrying next cycle"
-              sleep 2
+              sleep 60
             done
           }
-
           loop_availability() {
             while [ $(date +%s) -lt $END_TIME ]; do
               curl -s -m 65 "$BASE_URL/api/ingest-availability" -w "\nstatus: %{http_code}\n\n" || echo "request failed, retrying next cycle"
-              sleep 2
+              sleep 60
             done
           }
-
           loop_tours &
           loop_availability &
           wait
