@@ -1,6 +1,5 @@
 // scripts/ingest-availability.js
 // Runs directly on GitHub Actions runner — no Vercel handler wrapper needed.
-// Logic identical to /api/ingest-availability.js.
 
 const VIATOR_BASE = 'https://api.viator.com/partner';
 const VIATOR_KEY = process.env.VIATOR_API_KEY;
@@ -98,6 +97,12 @@ async function releaseLock() {
 
     console.log(`Availability — cursor: ${cursor ? 'yes' : 'no'}, lastSyncedAt: ${lastSyncedAt}`);
 
+    // DELTA MODE: no cursor saved + lastSyncedAt exists = fetch only recent changes
+    const isDeltaMode = !cursor && !!lastSyncedAt;
+    if (isDeltaMode) {
+      console.log('Running in DELTA MODE — fetching only recent price changes since last run.');
+    }
+
     const rateMap = await getExchangeRates();
     let hasMore = true;
 
@@ -174,15 +179,31 @@ async function releaseLock() {
       const nextCursor = data?.nextCursor || null;
       hasMore = !!nextCursor;
 
-      const metaUpdate = hasMore
-        ? { availability_cursor: nextCursor }
-        : { availability_cursor: null, availability_last_synced_at: new Date().toISOString() };
+      // DELTA MODE: save current time but do NOT persist cursor
+      // Next run will always start fresh from modifiedSince = now
+      if (isDeltaMode) {
+        await fetch(`${SUPABASE_URL}/ingest_meta?id=eq.1`, {
+          method: 'PATCH',
+          headers: sbHeaders({ Prefer: 'return=minimal' }),
+          body: JSON.stringify({
+            availability_cursor: null,
+            availability_last_synced_at: new Date().toISOString(),
+          }),
+        });
+        console.log(`Delta mode: processed 1 page, stopping. Matched: ${matchedCount}, Updated: ${updatedCount}`);
+        break;
+      } else {
+        // Backfill mode: follow cursor until has_more = false
+        const metaUpdate = hasMore
+          ? { availability_cursor: nextCursor }
+          : { availability_cursor: null, availability_last_synced_at: new Date().toISOString() };
 
-      await fetch(`${SUPABASE_URL}/ingest_meta?id=eq.1`, {
-        method: 'PATCH',
-        headers: sbHeaders({ Prefer: 'return=minimal' }),
-        body: JSON.stringify(metaUpdate),
-      });
+        await fetch(`${SUPABASE_URL}/ingest_meta?id=eq.1`, {
+          method: 'PATCH',
+          headers: sbHeaders({ Prefer: 'return=minimal' }),
+          body: JSON.stringify(metaUpdate),
+        });
+      }
 
       cursor = nextCursor;
 
