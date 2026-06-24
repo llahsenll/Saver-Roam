@@ -176,7 +176,6 @@ async function upsertChunked(records, log) {
 
 // --- MAIN ---
 (async () => {
-  const startedAt = new Date().toISOString();
   const log = [];
   let newInserted = 0;
   let updatedExisting = 0;
@@ -246,8 +245,9 @@ async function upsertChunked(records, log) {
         updatedExisting += result.updatedExisting;
       }
 
+      // FIX: save current time not start time — so delta runs use correct modifiedSince
       cursor = nextCursor;
-      await saveState(startedAt, cursor);
+      await saveState(new Date().toISOString(), cursor);
 
       if (pageCount % 10 === 0) {
         console.log(`Page ${pageCount}: ${totalFetched} fetched, ${newInserted} new, ${updatedExisting} updated, ${deactivated} inactive, ${skipped} non-Japan`);
@@ -256,7 +256,8 @@ async function upsertChunked(records, log) {
     } while (cursor && pageCount < MAX_PAGES);
 
     if (!cursor) {
-      await saveState(startedAt, null);
+      // FIX: save completion time not start time
+      await saveState(new Date().toISOString(), null);
       console.log('Full walk complete — cursor cleared, delta mode active.');
     }
 
