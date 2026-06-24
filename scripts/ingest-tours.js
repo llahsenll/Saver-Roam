@@ -1,6 +1,5 @@
 // scripts/ingest-tours.js
 // Runs directly on GitHub Actions runner — no Vercel handler wrapper needed.
-// Logic identical to /api/ingest-tours.js, just stripped of the Express handler.
 
 const VIATOR_BASE = 'https://api.viator.com/partner';
 const VIATOR_KEY = process.env.VIATOR_API_KEY;
@@ -197,15 +196,26 @@ async function upsertChunked(records, log) {
     const { isFirstRun, lastIngestedAt, savedCursor } = await getIngestState();
     console.log(`First run: ${isFirstRun}, cursor: ${savedCursor ? 'yes' : 'no'}, modifiedSince: ${lastIngestedAt}`);
 
+    // DELTA MODE: no cursor saved, not first run = use modifiedSince
+    // In delta mode we follow Viator's cursor to paginate through recent changes only,
+    // but we track whether we STARTED in delta mode so we know this is a bounded run.
+    const isDeltaMode = !savedCursor && !isFirstRun;
+    if (isDeltaMode) {
+      console.log('Running in DELTA MODE — fetching only recent changes since last run.');
+    }
+
     let cursor = savedCursor;
 
     do {
       let url;
       if (!cursor && isFirstRun) {
+        // Very first ever run — no modifiedSince, no cursor
         url = `/products/modified-since?count=50`;
       } else if (!cursor && !isFirstRun) {
+        // Delta mode first page — use modifiedSince
         url = `/products/modified-since?count=50&modifiedSince=${encodeURIComponent(lastIngestedAt)}`;
       } else {
+        // Mid-walk (backfill or delta pagination) — follow cursor
         url = `/products/modified-since?count=50&cursor=${encodeURIComponent(cursor)}`;
       }
 
@@ -245,18 +255,30 @@ async function upsertChunked(records, log) {
         updatedExisting += result.updatedExisting;
       }
 
-      // FIX: save current time not start time — so delta runs use correct modifiedSince
       cursor = nextCursor;
-      await saveState(new Date().toISOString(), cursor);
+
+      // DELTA MODE: save current time as checkpoint, but do NOT persist cursor.
+      // This means next run will always start fresh from modifiedSince = now,
+      // rather than resuming a potentially stale delta cursor from hours ago.
+      if (isDeltaMode) {
+        await saveState(new Date().toISOString(), null);
+      } else {
+        await saveState(new Date().toISOString(), cursor);
+      }
 
       if (pageCount % 10 === 0) {
         console.log(`Page ${pageCount}: ${totalFetched} fetched, ${newInserted} new, ${updatedExisting} updated, ${deactivated} inactive, ${skipped} non-Japan`);
       }
 
+      // DELTA MODE: stop after one page — don't follow Viator's cursor into a full walk
+      if (isDeltaMode) {
+        console.log(`Delta mode: processed 1 page, stopping. New: ${newInserted}, Updated: ${updatedExisting}`);
+        break;
+      }
+
     } while (cursor && pageCount < MAX_PAGES);
 
-    if (!cursor) {
-      // FIX: save completion time not start time
+    if (!cursor && !isDeltaMode) {
       await saveState(new Date().toISOString(), null);
       console.log('Full walk complete — cursor cleared, delta mode active.');
     }
