@@ -94,26 +94,33 @@ async function viatorGet(path) {
 
 async function getIngestState() {
   try {
-    const rows = await supabase('/ingest_meta?select=last_ingested_at,cursor&limit=1');
+    const rows = await supabase('/ingest_meta?select=last_ingested_at,cursor,backfill_complete&id=eq.1&limit=1');
     if (rows && rows.length > 0) {
+      const row = rows[0];
       return {
-        isFirstRun: !rows[0].last_ingested_at && !rows[0].cursor,
-        lastIngestedAt: rows[0].last_ingested_at || null,
-        savedCursor: rows[0].cursor || null,
+        isFirstRun: !row.last_ingested_at && !row.cursor && !row.backfill_complete,
+        lastIngestedAt: row.last_ingested_at || null,
+        savedCursor: row.cursor || null,
+        backfillComplete: !!row.backfill_complete,
       };
     }
   } catch (e) {
-    console.log('No ingest_meta — first run');
+    console.log('No ingest_meta row found — treating as first run.');
   }
-  return { isFirstRun: true, lastIngestedAt: null, savedCursor: null };
+  return { isFirstRun: true, lastIngestedAt: null, savedCursor: null, backfillComplete: false };
 }
 
-async function saveState(ts, cursor) {
-  await supabase('/ingest_meta', 'POST', {
+async function saveState(ts, cursor, backfillComplete) {
+  const payload = {
     id: 1,
     last_ingested_at: ts,
     cursor: cursor || null,
-  });
+  };
+  // Only write backfill_complete if explicitly passed
+  if (backfillComplete !== undefined) {
+    payload.backfill_complete = backfillComplete;
+  }
+  await supabase('/ingest_meta', 'POST', payload);
 }
 
 const LOCK_STALE_MS = 70000;
@@ -193,15 +200,20 @@ async function upsertChunked(records, log) {
       process.exit(0);
     }
 
-    const { isFirstRun, lastIngestedAt, savedCursor } = await getIngestState();
-    console.log(`First run: ${isFirstRun}, cursor: ${savedCursor ? 'yes' : 'no'}, modifiedSince: ${lastIngestedAt}`);
+    const { isFirstRun, lastIngestedAt, savedCursor, backfillComplete } = await getIngestState();
+    console.log(`State — firstRun: ${isFirstRun}, backfillComplete: ${backfillComplete}, cursor: ${savedCursor ? 'yes' : 'no'}, modifiedSince: ${lastIngestedAt}`);
 
-    // DELTA MODE: no cursor saved, not first run = use modifiedSince
-    // In delta mode we follow Viator's cursor to paginate through recent changes only,
-    // but we track whether we STARTED in delta mode so we know this is a bounded run.
-    const isDeltaMode = !savedCursor && !isFirstRun;
+    // MODE LOGIC:
+    // - isFirstRun: no row in ingest_meta at all — start fresh, no modifiedSince, no cursor
+    // - !backfillComplete: backfill in progress — follow cursor across runs until exhausted
+    // - backfillComplete: normal delta mode — 1 page from modifiedSince, then stop
+    const isBackfill = isFirstRun || !backfillComplete;
+    const isDeltaMode = backfillComplete;
+
     if (isDeltaMode) {
-      console.log('Running in DELTA MODE — fetching only recent changes since last run.');
+      console.log('DELTA MODE — fetching 1 page of recent changes then stopping.');
+    } else {
+      console.log('BACKFILL MODE — following cursor until catalog exhausted.');
     }
 
     let cursor = savedCursor;
@@ -211,12 +223,15 @@ async function upsertChunked(records, log) {
       if (!cursor && isFirstRun) {
         // Very first ever run — no modifiedSince, no cursor
         url = `/products/modified-since?count=50`;
-      } else if (!cursor && !isFirstRun) {
-        // Delta mode first page — use modifiedSince
+      } else if (!cursor && isDeltaMode) {
+        // Delta: use modifiedSince from last run
         url = `/products/modified-since?count=50&modifiedSince=${encodeURIComponent(lastIngestedAt)}`;
-      } else {
-        // Mid-walk (backfill or delta pagination) — follow cursor
+      } else if (cursor) {
+        // Backfill mid-walk or delta pagination — follow cursor
         url = `/products/modified-since?count=50&cursor=${encodeURIComponent(cursor)}`;
+      } else {
+        // Backfill but cursor was cleared (shouldn't happen, safety fallback)
+        url = `/products/modified-since?count=50`;
       }
 
       console.log('Calling Viator:', url);
@@ -257,33 +272,30 @@ async function upsertChunked(records, log) {
 
       cursor = nextCursor;
 
-      // DELTA MODE: save current time as checkpoint, but do NOT persist cursor.
-      // This means next run will always start fresh from modifiedSince = now,
-      // rather than resuming a potentially stale delta cursor from hours ago.
       if (isDeltaMode) {
-        await saveState(new Date().toISOString(), null);
+        // Delta: save timestamp, no cursor, backfill_complete stays true
+        await saveState(new Date().toISOString(), null, true);
+        console.log(`Delta mode: 1 page done. New: ${newInserted}, Updated: ${updatedExisting}. Stopping.`);
+        break;
       } else {
-        await saveState(new Date().toISOString(), cursor);
+        // Backfill: save cursor so next run resumes where we left off
+        await saveState(new Date().toISOString(), cursor, false);
       }
 
       if (pageCount % 10 === 0) {
         console.log(`Page ${pageCount}: ${totalFetched} fetched, ${newInserted} new, ${updatedExisting} updated, ${deactivated} inactive, ${skipped} non-Japan`);
       }
 
-      // DELTA MODE: stop after one page — don't follow Viator's cursor into a full walk
-      if (isDeltaMode) {
-        console.log(`Delta mode: processed 1 page, stopping. New: ${newInserted}, Updated: ${updatedExisting}`);
-        break;
-      }
-
     } while (cursor && pageCount < MAX_PAGES);
 
-    if (!cursor && !isDeltaMode) {
-      await saveState(new Date().toISOString(), null);
-      console.log('Full walk complete — cursor cleared, delta mode active.');
+    // Backfill finished — cursor exhausted
+    if (!isDeltaMode && !cursor) {
+      await saveState(new Date().toISOString(), null, true);
+      console.log('Backfill complete — cursor cleared, backfill_complete=true. Next runs will be delta mode.');
     }
 
     console.log(`Done. Pages: ${pageCount}, Fetched: ${totalFetched}, New: ${newInserted}, Updated: ${updatedExisting}, Inactive: ${deactivated}, Non-Japan: ${skipped}`);
+    if (log.length) console.log('Errors:', log.join('\n'));
 
   } catch (error) {
     console.error('Ingest failed:', error);
