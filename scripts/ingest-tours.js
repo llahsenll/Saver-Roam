@@ -51,6 +51,129 @@ function trimImages(images) {
   });
 }
 
+// "Private Vehicle (optional), Hotel Pickup in Tokyo City, Professional local guide"
+function formatInclusionList(items) {
+  if (!items || !Array.isArray(items) || items.length === 0) return null;
+  return items
+    .map(i => i.otherDescription || i.typeDescription || i.categoryDescription || null)
+    .filter(Boolean)
+    .join(', ') || null;
+}
+
+// Pipe-delimited per line: "Stop Name|Duration|Activities"
+// Matches RoamTourPage itinerary parser format
+function formatItinerary(itinerary) {
+  if (!itinerary) return null;
+  const items = itinerary.itineraryItems || itinerary.days?.[0]?.itineraryItems || null;
+  if (!items || !Array.isArray(items) || items.length === 0) return null;
+
+  return items.map(item => {
+    const name = item.pointOfInterestLocation?.location?.name
+      || item.name
+      || item.title
+      || 'Stop';
+
+    const duration = item.duration?.fixedDurationInMinutes
+      ? `${item.duration.fixedDurationInMinutes} min`
+      : item.duration?.variableDurationFromMinutes
+      ? `${item.duration.variableDurationFromMinutes}–${item.duration.variableDurationToMinutes || '?'} min`
+      : '';
+
+    const activities = []
+      .concat(item.passByWithoutStopping ? ['Pass by'] : [])
+      .concat(item.admissionIncluded ? ['Admission included'] : [])
+      .concat(item.description ? [item.description] : [])
+      .filter(Boolean)
+      .join(', ');
+
+    return `${name}|${duration}|${activities}`;
+  }).join('\n') || null;
+}
+
+// Raw array of highlight strings
+// e.g. ["Skip the line", "Small group", "Hotel pickup included"]
+// Stored as newline-separated text — vetting engine reads each line as a bullet
+function formatHighlights(highlights) {
+  if (!highlights || !Array.isArray(highlights) || highlights.length === 0) return null;
+  return highlights
+    .map(h => (typeof h === 'string' ? h : h.description || h.text || null))
+    .filter(Boolean)
+    .join('\n') || null;
+}
+
+// Additional info / Good to Know notes
+// Each item typically has a { type, description } shape
+// Stored as newline-separated text
+function formatAdditionalInfo(items) {
+  if (!items || !Array.isArray(items) || items.length === 0) return null;
+  return items
+    .map(i => {
+      if (typeof i === 'string') return i;
+      return i.description || i.text || i.otherDescription || null;
+    })
+    .filter(Boolean)
+    .join('\n') || null;
+}
+
+// Cancellation policy — pull the human-readable description if available,
+// otherwise fall back to the type key
+function formatCancellationPolicy(policy) {
+  if (!policy) return null;
+  if (typeof policy === 'string') return policy;
+  // Some tours return a description string directly
+  if (policy.description) return policy.description;
+  // Others return { type: 'STANDARD', cancelIfBadWeather, ... }
+  const type = policy.type || null;
+  const cutoff = policy.cancelIfBadWeather != null
+    ? (policy.cancelIfBadWeather ? ' · Weather cancellations allowed' : '')
+    : '';
+  const refundable = policy.refundEligibility
+    ? ` · Refund: ${policy.refundEligibility}`
+    : '';
+  return type ? `${type}${cutoff}${refundable}` : null;
+}
+
+// Logistics — extract meeting point and end point display text only
+// Full object is complex; we just want what's shown on the tour page
+function formatLogistics(logistics) {
+  if (!logistics) return null;
+
+  const parts = [];
+
+  // Start / meeting point
+  const start = logistics.start || logistics.meetingPoint || logistics.startingLocations?.[0];
+  if (start) {
+    const name = start.name || start.location?.name || null;
+    const address = start.address
+      || [start.streetAddress, start.city, start.country].filter(Boolean).join(', ')
+      || null;
+    const desc = start.description || null;
+    const meetingLine = [name, address, desc].filter(Boolean).join(' — ');
+    if (meetingLine) parts.push(`Meeting point: ${meetingLine}`);
+  }
+
+  // End / return point
+  const end = logistics.end || logistics.endingLocations?.[0];
+  if (end) {
+    const name = end.name || end.location?.name || null;
+    const address = end.address
+      || [end.streetAddress, end.city, end.country].filter(Boolean).join(', ')
+      || null;
+    const endLine = [name, address].filter(Boolean).join(' — ');
+    if (endLine) parts.push(`End point: ${endLine}`);
+  }
+
+  // Traveler pickup
+  if (logistics.travelerPickup) {
+    const pickup = logistics.travelerPickup;
+    if (pickup.pickupOptionType) {
+      parts.push(`Pickup: ${pickup.pickupOptionType.replace(/_/g, ' ').toLowerCase()}`);
+    }
+  }
+
+  return parts.length > 0 ? parts.join('\n') : null;
+}
+
 async function supabase(path, method = 'GET', body = null) {
   const res = await fetch(`${SUPABASE_URL}${path}`, {
     method,
@@ -116,7 +239,6 @@ async function saveState(ts, cursor, backfillComplete) {
     last_ingested_at: ts,
     cursor: cursor || null,
   };
-  // Only write backfill_complete if explicitly passed
   if (backfillComplete !== undefined) {
     payload.backfill_complete = backfillComplete;
   }
@@ -203,11 +325,6 @@ async function upsertChunked(records, log) {
     const { isFirstRun, lastIngestedAt, savedCursor, backfillComplete } = await getIngestState();
     console.log(`State — firstRun: ${isFirstRun}, backfillComplete: ${backfillComplete}, cursor: ${savedCursor ? 'yes' : 'no'}, modifiedSince: ${lastIngestedAt}`);
 
-    // MODE LOGIC:
-    // - isFirstRun: no row in ingest_meta at all — start fresh, no modifiedSince, no cursor
-    // - !backfillComplete: backfill in progress — follow cursor across runs until exhausted
-    // - backfillComplete: normal delta mode — 1 page from modifiedSince, then stop
-    const isBackfill = isFirstRun || !backfillComplete;
     const isDeltaMode = backfillComplete;
 
     if (isDeltaMode) {
@@ -221,16 +338,12 @@ async function upsertChunked(records, log) {
     do {
       let url;
       if (!cursor && isFirstRun) {
-        // Very first ever run — no modifiedSince, no cursor
         url = `/products/modified-since?count=50`;
       } else if (!cursor && isDeltaMode) {
-        // Delta: use modifiedSince from last run
         url = `/products/modified-since?count=50&modifiedSince=${encodeURIComponent(lastIngestedAt)}`;
       } else if (cursor) {
-        // Backfill mid-walk or delta pagination — follow cursor
         url = `/products/modified-since?count=50&cursor=${encodeURIComponent(cursor)}`;
       } else {
-        // Backfill but cursor was cleared (shouldn't happen, safety fallback)
         url = `/products/modified-since?count=50`;
       }
 
@@ -246,21 +359,27 @@ async function upsertChunked(records, log) {
         if (tour.status !== 'ACTIVE') { deactivated++; continue; }
         if (!isJapanTour(tour)) { skipped++; continue; }
         upsertBatch.push({
-          product_code: tour.productCode,
-          title: tour.title || null,
-          description: tour.description || null,
-          duration_minutes: extractDuration(tour),
-          max_group_size: extractMaxGroupSize(tour.pricingInfo),
-          rating: tour.reviews?.combinedAverageRating || null,
-          review_count: tour.reviews?.totalReviews || null,
-          images: tour.images ? JSON.stringify(trimImages(tour.images)) : null,
-          inclusions: tour.inclusions ? JSON.stringify(tour.inclusions) : null,
-          tags: tour.tags ? JSON.stringify(tour.tags) : null,
-          destination_id: tour.destinations?.[0]?.ref || null,
-          affiliate_url: tour.productUrl || null,
-          viator_status: 'ACTIVE',
-          modified_at: new Date().toISOString(),
-          vetting_status: 'pending',
+          product_code:         tour.productCode,
+          title:                tour.title || null,
+          description:          tour.description || null,
+          duration_minutes:     extractDuration(tour),
+          max_group_size:       extractMaxGroupSize(tour.pricingInfo),
+          rating:               tour.reviews?.combinedAverageRating || null,
+          review_count:         tour.reviews?.totalReviews || null,
+          images:               tour.images ? JSON.stringify(trimImages(tour.images)) : null,
+          inclusions:           formatInclusionList(tour.inclusions),
+          exclusions:           formatInclusionList(tour.exclusions),
+          itinerary:            formatItinerary(tour.itinerary),
+          highlights:           formatHighlights(tour.highlights),
+          additional_info:      formatAdditionalInfo(tour.additionalInfo),
+          cancellation_policy:  formatCancellationPolicy(tour.cancellationPolicy),
+          logistics:            formatLogistics(tour.logistics),
+          tags:                 tour.tags ? tour.tags.join(', ') : null,
+          destination_id:       tour.destinations?.[0]?.ref || null,
+          affiliate_url:        tour.productUrl || null,
+          viator_status:        'ACTIVE',
+          modified_at:          new Date().toISOString(),
+          vetting_status:       'pending',
         });
       }
 
@@ -273,12 +392,10 @@ async function upsertChunked(records, log) {
       cursor = nextCursor;
 
       if (isDeltaMode) {
-        // Delta: save timestamp, no cursor, backfill_complete stays true
         await saveState(new Date().toISOString(), null, true);
         console.log(`Delta mode: 1 page done. New: ${newInserted}, Updated: ${updatedExisting}. Stopping.`);
         break;
       } else {
-        // Backfill: save cursor so next run resumes where we left off
         await saveState(new Date().toISOString(), cursor, false);
       }
 
@@ -288,7 +405,6 @@ async function upsertChunked(records, log) {
 
     } while (cursor && pageCount < MAX_PAGES);
 
-    // Backfill finished — cursor exhausted
     if (!isDeltaMode && !cursor) {
       await saveState(new Date().toISOString(), null, true);
       console.log('Backfill complete — cursor cleared, backfill_complete=true. Next runs will be delta mode.');
